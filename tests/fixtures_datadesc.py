@@ -18,7 +18,7 @@ def _build_strtab(names):
     return strtab, offsets
 
 
-def make_data_desc_elf(descriptors, machine=EM_M32R):
+def make_data_desc_elf(descriptors, machine=EM_M32R, section_addr=0):
     """
     Build a data_desc ELF.
 
@@ -27,6 +27,10 @@ def make_data_desc_elf(descriptors, machine=EM_M32R):
       'desc_str'   : semicolon-delimited descriptor, e.g. 'value;Cat;Name;scl'
       'data_addr'  : absolute ROM address for the data symbol
                      (data sym name = desc_sym[2:])
+    section_addr: sh_addr the linker assigns to the data_desc section. Real
+      ROM builds place this section at a nonzero address (e.g. 0x60000), so
+      descriptor symbol st_value (an absolute address, since this is a linked
+      ELF) is section_addr + offset rather than a bare offset.
     Extra symbols (for axes referenced by map descriptors) can be injected via
     the same descriptor list — just include an entry for each axis symbol too.
     """
@@ -42,7 +46,7 @@ def make_data_desc_elf(descriptors, machine=EM_M32R):
     data_desc_idx = b.add_section(
         'data_desc', desc_section,
         sh_type=SHT_PROGBITS,
-        sh_flags=0, sh_addr=0,
+        sh_flags=0, sh_addr=section_addr,
     )
 
     # Build symbol string table
@@ -62,10 +66,11 @@ def make_data_desc_elf(descriptors, machine=EM_M32R):
         data_sym_name = desc_sym_name[2:]
         info = (STB_GLOBAL << 4) | STT_OBJECT
 
-        # Descriptor symbol: in data_desc section at str_offsets[i]
+        # Descriptor symbol: in data_desc section, absolute address
+        # section_addr + str_offsets[i] (st_value is absolute in a linked ELF)
         symtab += pack_sym(
             strtab_offsets[desc_sym_name],
-            str_offsets[i],   # st_value = offset into data_desc section
+            section_addr + str_offsets[i],
             0, info, 0,
             data_desc_idx,
         )

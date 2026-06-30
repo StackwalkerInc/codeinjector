@@ -65,7 +65,7 @@ fn main() {
         let section_data = section.data().unwrap_or(&[]);
 
         if name == "data_desc" {
-            datadesc::process_section(section_data, section.index(), &symbols, ecu, &ori_buf);
+            datadesc::process_section(section_data, section.address(), section.index(), &symbols, ecu, &ori_buf);
             continue;
         }
 
