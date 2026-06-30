@@ -166,6 +166,24 @@ def test_missing_data_sym(binary, rom, out, tmp_path):
     assert 'unable to find data symbol' in r.stdout
 
 
+def test_value_nonzero_section_base(binary, rom, out, tmp_path):
+    """data_desc section linked at a nonzero address (as real ROM builds do):
+    descriptor symbol st_value is absolute (section_addr + offset), so the
+    offset into section_data must be computed relative to the section base."""
+    inj = tmp_path / 'inj.elf'
+    inj.write_bytes(make_data_desc_elf(
+        [{'desc_sym': 'd_val', 'desc_str': 'value;Cat;ValName;scl', 'data_addr': 0x1234}],
+        section_addr=0x60000,
+    ))
+    r = subprocess.run([binary, 'mmc-m32r', str(rom), str(inj), str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0
+    assert "unable to find desc string" not in r.stdout
+    assert 'type="1D"' in r.stdout
+    assert 'ValName' in r.stdout
+    assert '1234' in r.stdout
+
+
 def test_axis_missing_symbols(binary, rom, out, tmp_path):
     """Map descriptor references axis symbol that doesn't exist → fallback <table> tag."""
     descriptors = [
