@@ -11,22 +11,17 @@ jobs:
   release:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.get-tag.outputs.tag }}
+      tag: ${{ steps.bump.outputs.next-version }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
-      - uses: tomtom-international/commisery-action/bump@699c46597f30a203a8465bfcdf7413c46cd100a5 # v7.1.0
+      - id: bump
+        uses: tomtom-international/commisery-action/bump@699c46597f30a203a8465bfcdf7413c46cd100a5 # v7.1.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           create-release: true
-
-      - name: Get created tag
-        id: get-tag
-        run: |
-          git fetch --tags
-          echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
 
   build-wheels:
     needs: release
