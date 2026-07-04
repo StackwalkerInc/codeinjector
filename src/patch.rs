@@ -97,7 +97,7 @@ fn encode_m32r_lduh_r1(data: &[u8]) -> Result<[u8; 4], &'static str> {
 }
 
 fn encode_m32r_splice(data: &[u8], vma: usize) -> Result<[u8; 8], &'static str> {
-    let data: &[u8; 4] = data
+    let data: &[u8; 8] = data
         .try_into()
         .map_err(|_| "Invalid splice injection section size")?;
     let target1 = u32::from_be_bytes(data[0..4].try_into().unwrap());
