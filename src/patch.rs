@@ -97,9 +97,9 @@ fn encode_m32r_lduh_r1(data: &[u8]) -> Result<[u8; 4], &'static str> {
 }
 
 fn encode_m32r_splice(data: &[u8], vma: usize) -> Result<[u8; 8], &'static str> {
-    if data.len() < 8 {
-        return Err("Invalid splice injection section size");
-    }
+    let data: &[u8; 4] = data
+        .try_into()
+        .map_err(|_| "Invalid splice injection section size")?;
     let target1 = u32::from_be_bytes(data[0..4].try_into().unwrap());
     let target2 = u32::from_be_bytes(data[4..8].try_into().unwrap());
     let pc1 = vma as u32;
@@ -118,9 +118,9 @@ fn encode_m32r_splice(data: &[u8], vma: usize) -> Result<[u8; 8], &'static str> 
 
 // Returns (buf, total_patch_size). buf is 14 bytes max; only buf[..size] is valid.
 fn encode_sh_jump_to_body(data: &[u8], vma: usize) -> Result<([u8; 14], usize), &'static str> {
-    if data.len() < 4 {
-        return Err("Invalid jump-to-body injection instruction section size");
-    }
+    let data: &[u8; 4] = data
+        .try_into()
+        .map_err(|_| "Invalid jump-to-body injection instruction section size")?;
     let nop_prefix = match vma % 4 {
         2 => true,
         0 => false,
@@ -131,20 +131,20 @@ fn encode_sh_jump_to_body(data: &[u8], vma: usize) -> Result<([u8; 14], usize), 
     if nop_prefix {
         buf[0..2].copy_from_slice(&[0x00, 0x09]);
         buf[2..10].copy_from_slice(&static_body);
-        buf[10..14].copy_from_slice(&data[0..4]);
+        buf[10..14].copy_from_slice(data);
         Ok((buf, 14))
     } else {
         buf[0..8].copy_from_slice(&static_body);
-        buf[8..12].copy_from_slice(&data[0..4]);
+        buf[8..12].copy_from_slice(data);
         Ok((buf, 12))
     }
 }
 
 // Returns (buf, total_patch_size). buf is 26 bytes max; only buf[..size] is valid.
 fn encode_sh_splice(data: &[u8], vma: usize) -> Result<([u8; 26], usize), &'static str> {
-    if data.len() < 8 {
-        return Err("Invalid splice injection section size");
-    }
+    let data: &[u8; 8] = data
+        .try_into()
+        .map_err(|_| "Invalid splice injection section size")?;
     let nop_prefix = match vma % 4 {
         2 => true,
         0 => false,
@@ -158,11 +158,11 @@ fn encode_sh_splice(data: &[u8], vma: usize) -> Result<([u8; 26], usize), &'stat
     if nop_prefix {
         buf[0..2].copy_from_slice(&[0x00, 0x09]);
         buf[2..18].copy_from_slice(&static_body);
-        buf[18..26].copy_from_slice(&data[0..8]);
+        buf[18..26].copy_from_slice(data);
         Ok((buf, 26))
     } else {
         buf[0..16].copy_from_slice(&static_body);
-        buf[16..24].copy_from_slice(&data[0..8]);
+        buf[16..24].copy_from_slice(data);
         Ok((buf, 24))
     }
 }
