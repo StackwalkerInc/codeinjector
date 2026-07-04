@@ -61,22 +61,23 @@ fn print_patch_xml(
 }
 
 fn encode_m32r_bl(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
-    if data.len() != 4 {
-        return Err("Invalid bl injection instruction section size");
-    }
-    let target = u32::from_be_bytes(data[0..4].try_into().unwrap());
-    let pc = vma as u32;
-    let patch = 0xfe000000u32.wrapping_add(
-        (target.wrapping_sub(pc) >> 2) & 0x00ff_ffff,
-    );
+    let target = data
+        .try_into()
+        .map(u32::from_be_bytes)
+        .map_err(|_| "Invalid bl injection instruction section size")?;
+
+    let offset = (target.wrapping_sub(vma as u32) >> 2) & 0x00ff_ffff;
+    let patch = 0xfe00_0000 | offset;
+
     Ok(patch.to_be_bytes())
 }
 
 fn encode_m32r_ld24(data: &[u8], r4: bool) -> Result<[u8; 4], &'static str> {
-    if data.len() != 4 {
-        return Err("Invalid ld24 injection instruction section size");
-    }
-    let target = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    let target = data
+        .try_into()
+        .map(u32::from_be_bytes)
+        .map_err(|_| "Invalid ld24 injection instruction section size")?;
+
     let mut patch = 0xe000_0000u32.wrapping_add(target);
     if r4 {
         patch = patch.wrapping_add(4u32 << 24);
@@ -85,10 +86,11 @@ fn encode_m32r_ld24(data: &[u8], r4: bool) -> Result<[u8; 4], &'static str> {
 }
 
 fn encode_m32r_lduh_r1(data: &[u8]) -> Result<[u8; 4], &'static str> {
-    if data.len() != 4 {
-        return Err("Invalid lduh injection instruction section size");
-    }
-    let target = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    let target = data
+        .try_into()
+        .map(u32::from_be_bytes)
+        .map_err(|_| "Invalid lduh injection instruction section size")?;
+
     let disp16 = target.wrapping_sub(0x8000_8000) as u16;
     let dst_register: u32 = 1;
     let patch = 0xa0bd_0000u32
