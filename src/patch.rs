@@ -72,16 +72,13 @@ fn encode_m32r_bl(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
     Ok(patch.to_be_bytes())
 }
 
-fn encode_m32r_ld24(data: &[u8], r4: bool) -> Result<[u8; 4], &'static str> {
+fn encode_m32r_ld24(data: &[u8], register_index: u32) -> Result<[u8; 4], &'static str> {
     let target = data
         .try_into()
         .map(u32::from_be_bytes)
         .map_err(|_| "Invalid ld24 injection instruction section size")?;
 
-    let mut patch = 0xe000_0000u32.wrapping_add(target);
-    if r4 {
-        patch = patch.wrapping_add(4u32 << 24);
-    }
+    let patch = 0xe000_0000u32 | (register_index << 24) | target;
     Ok(patch.to_be_bytes())
 }
 
@@ -200,7 +197,7 @@ pub fn inject_section(
             (vma, 4)
         }
         PatchMethod::M32rLd24R0 => {
-            let patch = encode_m32r_ld24(section_data, false).unwrap_or_else(|e| {
+            let patch = encode_m32r_ld24(section_data, 0u32).unwrap_or_else(|e| {
                 eprintln!("{}", e);
                 crate::usage_and_exit();
             });
@@ -208,7 +205,7 @@ pub fn inject_section(
             (vma, 4)
         }
         PatchMethod::M32rLd24R4 => {
-            let patch = encode_m32r_ld24(section_data, true).unwrap_or_else(|e| {
+            let patch = encode_m32r_ld24(section_data, 4u32).unwrap_or_else(|e| {
                 eprintln!("{}", e);
                 crate::usage_and_exit();
             });
@@ -291,9 +288,9 @@ mod tests {
     #[test]
     fn test_encode_m32r_ld24() {
         // target=0x1234 → r0: 0xe0001234, r4: 0xe4001234
-        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], false).unwrap(), [0xe0, 0x00, 0x12, 0x34]);
-        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], true).unwrap(),  [0xe4, 0x00, 0x12, 0x34]);
-        assert!(encode_m32r_ld24(&[0x00; 8], false).is_err());
+        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], 0u32).unwrap(), [0xe0, 0x00, 0x12, 0x34]);
+        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], 4u32).unwrap(),  [0xe4, 0x00, 0x12, 0x34]);
+        assert!(encode_m32r_ld24(&[0x00; 8], 0u32).is_err());
     }
 
     #[test]
