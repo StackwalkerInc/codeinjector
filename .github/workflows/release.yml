@@ -18,7 +18,7 @@ jobs:
           fetch-depth: 0
 
       - id: bump
-        uses: tomtom-international/commisery-action/bump@699c46597f30a203a8465bfcdf7413c46cd100a5 # v7.1.0
+        uses: tomtom-international/commisery-action/bump@1910dece6192da25e159477b7de11ec1b722eefc # v8.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           create-release: true
