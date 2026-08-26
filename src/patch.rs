@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PatchMethod {
     M32rBl,
+    M32rBra,
     M32rLd24R0,
     M32rLd24R4,
     M32rLduhR1,
@@ -17,6 +18,7 @@ pub enum PatchMethod {
 
 static PATCH_MARKERS: &[(&str, PatchMethod)] = &[
     ("[m32r-bl]",                     PatchMethod::M32rBl),
+    ("[m32r-bra]",                    PatchMethod::M32rBra),
     ("[m32r-ld24-r0]",                PatchMethod::M32rLd24R0),
     ("[m32r-ld24-r4]",                PatchMethod::M32rLd24R4),
     ("[m32r-lduh-r1]",                PatchMethod::M32rLduhR1),
@@ -68,6 +70,18 @@ fn encode_m32r_bl(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
 
     let offset = (target.wrapping_sub(vma as u32) >> 2) & 0x00ff_ffff;
     let patch = 0xfe00_0000 | offset;
+
+    Ok(patch.to_be_bytes())
+}
+
+fn encode_m32r_bra(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
+    let target = data
+        .try_into()
+        .map(u32::from_be_bytes)
+        .map_err(|_| "Invalid bra injection instruction section size")?;
+
+    let offset = (target.wrapping_sub(vma as u32) >> 2) & 0x00ff_ffff;
+    let patch = 0xff00_0000 | offset;
 
     Ok(patch.to_be_bytes())
 }
@@ -196,6 +210,14 @@ pub fn inject_section(
             out_buf[vma..vma + 4].copy_from_slice(&patch);
             (vma, 4)
         }
+        PatchMethod::M32rBra => {
+            let patch = encode_m32r_bra(section_data, vma).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                crate::usage_and_exit();
+            });
+            out_buf[vma..vma + 4].copy_from_slice(&patch);
+            (vma, 4)
+        }
         PatchMethod::M32rLd24R0 => {
             let patch = encode_m32r_ld24(section_data, 0u32).unwrap_or_else(|e| {
                 eprintln!("{}", e);
@@ -264,6 +286,7 @@ mod tests {
     #[test]
     fn test_get_patch_method_all_markers() {
         assert_eq!(get_patch_method("[m32r-bl].text"),                    PatchMethod::M32rBl);
+        assert_eq!(get_patch_method("[m32r-bra].text"),                   PatchMethod::M32rBra);
         assert_eq!(get_patch_method("[m32r-ld24-r0].text"),               PatchMethod::M32rLd24R0);
         assert_eq!(get_patch_method("[m32r-ld24-r4].text"),               PatchMethod::M32rLd24R4);
         assert_eq!(get_patch_method("[m32r-lduh-r1].text"),               PatchMethod::M32rLduhR1);
@@ -283,6 +306,17 @@ mod tests {
         assert_eq!(result.unwrap(), [0xfe, 0x00, 0x04, 0x00]);
         // Wrong size
         assert!(encode_m32r_bl(&[0x00; 8], 0x1000).is_err());
+    }
+
+    #[test]
+    fn test_get_patch_method_bra() {
+        assert_eq!(get_patch_method("[m32r-bra]"), PatchMethod::M32rBra);
+    }
+
+    #[test]
+    fn test_encode_m32r_bra_forward() {
+        let data = 0x2000u32.to_be_bytes();
+        assert_eq!(encode_m32r_bra(&data, 0x1000).unwrap(), [0xff, 0x00, 0x04, 0x00]);
     }
 
     #[test]

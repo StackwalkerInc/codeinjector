@@ -16,6 +16,12 @@ def make_m32r_bl_elf(vma=0x1000, target=0x2000):
     return b.build()
 
 
+def make_m32r_bra_elf(vma=0x1000, target=0x2000):
+    b = ELFBuilder(EM_M32R)
+    b.add_section('[m32r-bra]', _be32(target), sh_flags=SHF_ALLOC, sh_addr=vma)
+    return b.build()
+
+
 def make_m32r_ld24_r0_elf(vma=0x1000, target=0x1234):
     b = ELFBuilder(EM_M32R)
     b.add_section('[m32r-ld24-r0]', _be32(target), sh_flags=SHF_ALLOC, sh_addr=vma)
