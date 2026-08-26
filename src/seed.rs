@@ -11,11 +11,7 @@ pub const SEED_KIND_MAP3D8: u32 = 2;
 pub struct SeedRecord {
     pub kind: u32,
     pub dst: u32,
-    // `src`/`src_yaxis` are unread until Tasks 3 and 4 implement
-    // seed_axis/seed_map3d8, which will consume them as source addresses.
-    #[allow(dead_code)]
     pub src: u32,
-    #[allow(dead_code)]
     pub src_yaxis: u32,
 }
 
@@ -169,6 +165,56 @@ fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String>
     Ok(())
 }
 
-fn seed_map3d8(_rec: &SeedRecord, _dst: &mut [u8], _ori: &[u8]) -> Result<(), String> {
-    Err("3dmap8 seeding not implemented".to_string())
+const MAP3D8_HEADER: usize = 7;
+
+fn seed_map3d8(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String> {
+    let src = rec.src as usize;
+    let yaxis = rec.src_yaxis as usize;
+
+    let stock_xs = *ori
+        .get(src + 6)
+        .ok_or_else(|| format!("stock map {src:#x} header runs past end of ROM"))?
+        as usize;
+    if stock_xs == 0 {
+        return Err(format!("stock map {src:#x} declares xsize 0"));
+    }
+    let stock_ys = be16(ori, yaxis + 4)? as usize;
+    if stock_ys == 0 {
+        return Err(format!("stock y-axis {yaxis:#x} declares size 0"));
+    }
+
+    if dst.len() < MAP3D8_HEADER || !(dst.len() - MAP3D8_HEADER).is_multiple_of(stock_xs) {
+        return Err(format!(
+            "seeded map at {:#x} has size {}, which is not {MAP3D8_HEADER} + {stock_xs}*n",
+            rec.dst,
+            dst.len()
+        ));
+    }
+    let new_ys = (dst.len() - MAP3D8_HEADER) / stock_xs;
+    if new_ys < stock_ys {
+        return Err(format!(
+            "seeded map at {:#x} has {new_ys} rows, fewer than stock's {stock_ys}",
+            rec.dst
+        ));
+    }
+
+    // Header copied verbatim: type, offset, xsrc, ysrc, xsize.
+    let hdr = ori
+        .get(src..src + MAP3D8_HEADER)
+        .ok_or_else(|| format!("stock map {src:#x} header runs past end of ROM"))?;
+    dst[0..MAP3D8_HEADER].copy_from_slice(hdr);
+
+    // Body: clamped row/column replication.
+    let body_src = src + MAP3D8_HEADER;
+    for y in 0..new_ys {
+        let sy = y.min(stock_ys - 1);
+        for x in 0..stock_xs {
+            let sx = x.min(stock_xs - 1);
+            let v = *ori.get(body_src + sy * stock_xs + sx).ok_or_else(|| {
+                format!("stock map {src:#x} body runs past end of ROM")
+            })?;
+            dst[MAP3D8_HEADER + y * stock_xs + x] = v;
+        }
+    }
+    Ok(())
 }

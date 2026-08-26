@@ -124,3 +124,91 @@ def test_axis_seed_rejects_single_entry_stock(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+
+
+def _map3d8(type_, offset, xsrc, ysrc, xsize, rows):
+    """Pack a stock 3dmap8. rows is a list of `xsize`-length lists."""
+    body = bytes(v for row in rows for v in row)
+    return struct.pack('>BBhhB', type_, offset, xsrc, ysrc, xsize) + body
+
+
+def _rom_with_many(tmp_path, blobs, size=0x10000):
+    p = tmp_path / 'rom.bin'
+    buf = bytearray(b'\x00' * size)
+    for at, blob in blobs:
+        buf[at:at + len(blob)] = blob
+    p.write_bytes(bytes(buf))
+    return p
+
+
+def test_map_seed_copies_header_and_replicates_last_row(binary, tmp_path):
+    from conftest import run
+    stock_map_at, stock_axis_at = 0x3000, 0x3800
+    stock_map = _map3d8(3, 20, -13338, -13336, xsize=3,
+                        rows=[[1, 2, 3], [4, 5, 6]])
+    stock_axis = _axis(dst=-13336, src=-13344, values=[10, 20])
+    rom = _rom_with_many(tmp_path, [(stock_map_at, stock_map),
+                                    (stock_axis_at, stock_axis)])
+
+    # New map: xsize 3, ysize 4 -> 7 + 12 = 19 bytes
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000,
+                             src=stock_map_at, src_yaxis=stock_axis_at)],
+        payload_addr=0x2000, payload=b'\x00' * 19,
+    )
+    r, romout = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode == 0, r.stderr
+
+    hdr = struct.unpack('>BBhhB', romout[0x2000:0x2007])
+    assert hdr == (3, 20, -13338, -13336, 3)   # header copied verbatim
+    body = list(romout[0x2007:0x2013])
+    assert body == [1, 2, 3,
+                    4, 5, 6,
+                    4, 5, 6,    # last stock row replicated
+                    4, 5, 6]
+
+
+def test_map_seed_rejects_indivisible_size(binary, tmp_path):
+    from conftest import run
+    stock_map = _map3d8(3, 0, -1, -2, xsize=3, rows=[[1, 2, 3], [4, 5, 6]])
+    stock_axis = _axis(dst=-2, src=-3, values=[10, 20])
+    rom = _rom_with_many(tmp_path, [(0x3000, stock_map), (0x3800, stock_axis)])
+    # 7 + 11 is not 7 + 3*n
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=0x3000,
+                             src_yaxis=0x3800)],
+        payload_addr=0x2000, payload=b'\x00' * 18,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+
+
+def test_map_seed_rejects_shrinking(binary, tmp_path):
+    from conftest import run
+    stock_map = _map3d8(3, 0, -1, -2, xsize=3, rows=[[1, 2, 3], [4, 5, 6]])
+    stock_axis = _axis(dst=-2, src=-3, values=[10, 20])
+    rom = _rom_with_many(tmp_path, [(0x3000, stock_map), (0x3800, stock_axis)])
+    # ysize 1 < stock ysize 2
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=0x3000,
+                             src_yaxis=0x3800)],
+        payload_addr=0x2000, payload=b'\x00' * 10,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+
+
+def test_seeded_bytes_appear_in_emitted_xml(binary, tmp_path):
+    from conftest import run
+    stock_map = _map3d8(3, 20, -13338, -13336, xsize=3, rows=[[1, 2, 3], [4, 5, 6]])
+    stock_axis = _axis(dst=-13336, src=-13344, values=[10, 20])
+    rom = _rom_with_many(tmp_path, [(0x3000, stock_map), (0x3800, stock_axis)])
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=0x3000,
+                             src_yaxis=0x3800)],
+        payload_addr=0x2000, payload=b'\x00' * 19,
+    )
+    r, romout = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode == 0, r.stderr
+    patched_hex = romout[0x2000:0x2013].hex()
+    assert patched_hex in r.stdout.replace('\n', '')
