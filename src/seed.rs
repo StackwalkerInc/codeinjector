@@ -11,12 +11,16 @@ pub const SEED_KIND_MAP3D8: u32 = 2;
 pub struct SeedRecord {
     pub kind: u32,
     pub dst: u32,
+    // `src`/`src_yaxis` are unread until Tasks 3 and 4 implement
+    // seed_axis/seed_map3d8, which will consume them as source addresses.
+    #[allow(dead_code)]
     pub src: u32,
+    #[allow(dead_code)]
     pub src_yaxis: u32,
 }
 
 pub fn parse_records(section_data: &[u8]) -> Result<Vec<SeedRecord>, String> {
-    if section_data.len() % SEED_RECORD_SIZE != 0 {
+    if !section_data.len().is_multiple_of(SEED_RECORD_SIZE) {
         return Err(format!(
             "data_seed section size {} is not a multiple of {}",
             section_data.len(),
