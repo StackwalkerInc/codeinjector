@@ -4,6 +4,7 @@
 mod datadesc;
 mod ecu;
 mod patch;
+mod seed;
 
 use std::fs;
 use std::io::Write;
@@ -50,13 +51,34 @@ fn main() {
         .map(|s| datadesc::SymInfo {
             name: s.name().unwrap_or("").to_string(),
             address: s.address(),
+            size: s.size(),
             section_index: s.section_index(),
             is_section_sym: s.kind() == SymbolKind::Section,
         })
         .collect();
     symbols.sort_unstable_by_key(|s| s.name.clone());
 
-    // Process sections (mirrors bfd_map_over_sections)
+    // Pass 1: collect seed records. They are applied to section bytes before
+    // injection so that the patched .bin and the emitted XML agree.
+    let mut seed_records: Vec<seed::SeedRecord> = Vec::new();
+    for section in injection_file.sections() {
+        if section.name().unwrap_or("") != "data_seed" {
+            continue;
+        }
+        let parsed = seed::parse_records(section.data().unwrap_or(&[])).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            usage_and_exit();
+        });
+        seed_records.extend(parsed);
+    }
+    // Tracks, across the whole section loop below, which seed records were
+    // ever applied to some section. A record whose `dst` lands in no
+    // injected section at all (e.g. a mis-wired linker script) would
+    // otherwise be silently dropped -- exit 0 with a ROM full of zeroed
+    // tables. That failure mode is checked for after the loop.
+    let mut seed_applied = vec![false; seed_records.len()];
+
+    // Pass 2: process sections.
     for section in injection_file.sections() {
         let name = match section.name() {
             Ok(n) => n.to_string(),
@@ -66,6 +88,9 @@ fn main() {
 
         if name == "data_desc" {
             datadesc::process_section(section_data, section.address(), section.index(), &symbols, ecu, &ori_buf);
+            continue;
+        }
+        if name == "data_seed" {
             continue;
         }
 
@@ -84,14 +109,43 @@ fn main() {
             continue;
         }
 
+        let mut section_bytes = section_data.to_vec();
+        seed::apply_records(
+            &seed_records,
+            section.address(),
+            &mut section_bytes,
+            &symbols,
+            &ori_buf,
+            ecu,
+            &mut seed_applied,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            usage_and_exit();
+        });
+
         patch::inject_section(
             &name,
             section.address() as usize,
-            section_data,
+            &section_bytes,
             ecu,
             &ori_buf,
             &mut out_buf,
         );
+    }
+
+    let unapplied: Vec<String> = seed_records
+        .iter()
+        .zip(seed_applied.iter())
+        .filter(|(_, &applied)| !applied)
+        .map(|(rec, _)| format!("{:#x}", rec.dst))
+        .collect();
+    if !unapplied.is_empty() {
+        eprintln!(
+            "data_seed record(s) never applied -- dst not in any injected section: {}",
+            unapplied.join(", ")
+        );
+        usage_and_exit();
     }
 
     if args.len() > 4 {

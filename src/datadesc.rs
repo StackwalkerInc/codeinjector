@@ -7,6 +7,7 @@ use crate::ecu::EcuDescription;
 pub struct SymInfo {
     pub name: String,
     pub address: u64,
+    pub size: u64,
     pub section_index: Option<SectionIndex>,
     pub is_section_sym: bool,
 }
