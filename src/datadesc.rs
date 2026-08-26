@@ -59,6 +59,71 @@ fn get_data_desc_type(s: &str) -> DataDescType {
     }
 }
 
+/// Splits a plain `axis;<username>;<scaling>;<size>` descriptor string into
+/// its `(name, scaling, size)` fields. Shared by `emit_axis_desc` (which
+/// prints them) and `collect_axis_descriptors` (which cross-checks the size
+/// against the destination symbol's actual storage).
+fn parse_axis_desc_fields(s: &str) -> (&str, &str, &str) {
+    let mut p = s.splitn(5, ';');
+    p.next(); // "axis"
+    let name = p.next().unwrap_or("");
+    let scl = p.next().unwrap_or("");
+    let size = p.next().unwrap_or("");
+    (name, scl, size)
+}
+
+/// One `axis;...` entry found in a `data_desc` section: the descriptor
+/// symbol and the data symbol it describes, plus the element count the
+/// descriptor string declares (this is what reaches the emitted EcuFlash XML
+/// as `elements="N"`).
+pub struct AxisDescriptor {
+    pub desc_symbol: String,
+    pub data_symbol: String,
+    pub data_addr: u64,
+    pub declared_size: usize,
+}
+
+/// Scans a `data_desc` section for plain `axis` (not `axisex`) descriptors
+/// and returns their declared sizes. `axisex` descriptors have no literal
+/// size field -- their size is read back from the ROM instead -- so they are
+/// not represented here.
+pub fn collect_axis_descriptors(
+    section_data: &[u8],
+    section_addr: u64,
+    section_index: SectionIndex,
+    symbols: &[SymInfo],
+) -> Vec<AxisDescriptor> {
+    let mut out = Vec::new();
+    for sym in symbols
+        .iter()
+        .filter(|s| s.section_index == Some(section_index) && !s.is_section_sym)
+    {
+        let desc_str = match get_data_desc_string(sym.address, section_addr, section_data) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        if get_data_desc_type(&desc_str) != DataDescType::Axis {
+            continue;
+        }
+        let data_sym = match get_data_symbol(&sym.name, symbols) {
+            Some(s) => s,
+            None => continue,
+        };
+        let (_, _, size_str) = parse_axis_desc_fields(&desc_str);
+        let declared_size: usize = match size_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        out.push(AxisDescriptor {
+            desc_symbol: sym.name.clone(),
+            data_symbol: data_sym.name.clone(),
+            data_addr: data_sym.address,
+            declared_size,
+        });
+    }
+    out
+}
+
 fn get_axis_size(rom_addr: usize, ori_buf: &[u8], short_pointer_size: usize) -> u16 {
     let offset = rom_addr + 2 * short_pointer_size;
     if offset + 2 > ori_buf.len() {
@@ -151,11 +216,7 @@ fn emit_axis_desc(
     match (desc_sym, data_sym) {
         (Some(ds), Some(da)) => {
             if let Some(str_val) = get_data_desc_string(ds.address, section_addr, section_data) {
-                let mut p = str_val.splitn(5, ';');
-                p.next();
-                let name  = p.next().unwrap_or("");
-                let scl   = p.next().unwrap_or("");
-                let size  = p.next().unwrap_or("");
+                let (name, scl, size) = parse_axis_desc_fields(&str_val);
                 let axis_header = 2 * short_pointer_size + 2;
                 let addr = da.address as usize + axis_header;
                 println!("\t<table name=\"{name}\" type=\"{axis_type} Axis\" address=\"{addr:x}\" elements=\"{size}\" scaling=\"{scl}\"/>");

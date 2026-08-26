@@ -58,19 +58,47 @@ fn main() {
         .collect();
     symbols.sort_unstable_by_key(|s| s.name.clone());
 
-    // Pass 1: collect seed records. They are applied to section bytes before
-    // injection so that the patched .bin and the emitted XML agree.
+    // Pass 1: collect seed records, and the axis descriptors from data_desc
+    // sections that seed records will be cross-checked against. Seed records
+    // are applied to section bytes before injection so that the patched
+    // .bin and the emitted XML agree.
     let mut seed_records: Vec<seed::SeedRecord> = Vec::new();
+    let mut axis_descriptors: Vec<datadesc::AxisDescriptor> = Vec::new();
     for section in injection_file.sections() {
-        if section.name().unwrap_or("") != "data_seed" {
-            continue;
+        match section.name().unwrap_or("") {
+            "data_seed" => {
+                let parsed =
+                    seed::parse_records(section.data().unwrap_or(&[])).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        usage_and_exit();
+                    });
+                seed_records.extend(parsed);
+            }
+            "data_desc" => {
+                axis_descriptors.extend(datadesc::collect_axis_descriptors(
+                    section.data().unwrap_or(&[]),
+                    section.address(),
+                    section.index(),
+                    &symbols,
+                ));
+            }
+            _ => {}
         }
-        let parsed = seed::parse_records(section.data().unwrap_or(&[])).unwrap_or_else(|e| {
+    }
+
+    // Pre-pass: cross-check seed records against each other and against
+    // data_desc, before any seeding is performed. Both are hard-fails
+    // required by the seeding design spec -- see seed.rs for why.
+    seed::validate_cross_record(&seed_records, &symbols, &ori_buf).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        usage_and_exit();
+    });
+    seed::validate_declared_sizes(&seed_records, &symbols, &ori_buf, &axis_descriptors)
+        .unwrap_or_else(|e| {
             eprintln!("{e}");
             usage_and_exit();
         });
-        seed_records.extend(parsed);
-    }
+
     // Tracks, across the whole section loop below, which seed records were
     // ever applied to some section. A record whose `dst` lands in no
     // injected section at all (e.g. a mis-wired linker script) would

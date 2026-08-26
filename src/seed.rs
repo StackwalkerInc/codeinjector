@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Aleksei Markelov
 
-use crate::datadesc::SymInfo;
+use crate::datadesc::{AxisDescriptor, SymInfo};
 use crate::ecu::EcuDescription;
 
 pub const SEED_RECORD_SIZE: usize = 16;
@@ -97,7 +97,87 @@ pub fn apply_records(
     Ok(())
 }
 
+/// Cross-checks `data_seed` records against each other, before any seeding is
+/// performed.
+///
+/// A `SEED_KIND_MAP3D8` record's `src_yaxis` names the stock y-axis whose row
+/// count the ECU's `calc_axis` will use to index the map body at runtime. If
+/// some `SEED_KIND_AXIS` record seeds that very same stock axis (`src ==
+/// src_yaxis`), the two seeded tables are coupled at runtime even though they
+/// are declared -- and sized -- by two independent macros in the C source
+/// (`DECLARE_AXIS_SEEDED` / `DECLARE_3DMAP8_SEEDED`). Since the spec allows
+/// those sizes to be "freely editable afterwards", editing one and not the
+/// other is an expected maintenance action; this catches the resulting
+/// mismatch at build time instead of shipping a ROM where the axis walks off
+/// the end of the map body on a running engine.
+pub fn validate_cross_record(
+    records: &[SeedRecord],
+    symbols: &[SymInfo],
+    ori_buf: &[u8],
+) -> Result<(), String> {
+    for map_rec in records.iter().filter(|r| r.kind == SEED_KIND_MAP3D8) {
+        for axis_rec in records
+            .iter()
+            .filter(|r| r.kind == SEED_KIND_AXIS && r.src == map_rec.src_yaxis)
+        {
+            let axis_len = symbol_size_at(axis_rec.dst, symbols)?;
+            let axis = axis_dims(axis_rec, axis_len, ori_buf)?;
+            let map_len = symbol_size_at(map_rec.dst, symbols)?;
+            let map = map3d8_dims(map_rec, map_len, ori_buf)?;
+
+            if axis.new_n != map.new_ys {
+                return Err(format!(
+                    "seeded axis at {:#x} has {} entries but seeded map at {:#x} \
+                     has {} rows, though both are seeded from the same stock \
+                     y-axis {:#x}; the axis and map row counts must agree",
+                    axis_rec.dst, axis.new_n, map_rec.dst, map.new_ys, map_rec.src_yaxis
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cross-checks each seeded axis's actual size (from its ELF symbol, the same
+/// value `seed_axis` will write as the new row count) against the size
+/// declared in its `data_desc` descriptor, if one exists for that
+/// destination. `data_desc` is the source of the `elements="N"` attribute
+/// EcuFlash reads to bound its table editor; if it disagrees with the
+/// storage the symbol actually has, EcuFlash would let a user edit past the
+/// end of the real table.
+pub fn validate_declared_sizes(
+    records: &[SeedRecord],
+    symbols: &[SymInfo],
+    ori_buf: &[u8],
+    axis_descriptors: &[AxisDescriptor],
+) -> Result<(), String> {
+    for rec in records.iter().filter(|r| r.kind == SEED_KIND_AXIS) {
+        let matching: Vec<&AxisDescriptor> = axis_descriptors
+            .iter()
+            .filter(|d| d.data_addr == u64::from(rec.dst))
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let dst_len = symbol_size_at(rec.dst, symbols)?;
+        let dims = axis_dims(rec, dst_len, ori_buf)?;
+        for d in matching {
+            if d.declared_size != dims.new_n {
+                return Err(format!(
+                    "seeded axis at {:#x} (symbol {}) will hold {} entries, but its \
+                     data_desc descriptor {} declares elements=\"{}\"; EcuFlash would \
+                     edit past the end of the real table -- update the descriptor's \
+                     size to match",
+                    rec.dst, d.data_symbol, dims.new_n, d.desc_symbol, d.declared_size
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 const AXIS_HEADER: usize = 6;
+const MAP3D8_HEADER: usize = 7;
 
 fn be16(buf: &[u8], off: usize) -> Result<u16, String> {
     buf.get(off..off + 2)
@@ -105,18 +185,26 @@ fn be16(buf: &[u8], off: usize) -> Result<u16, String> {
         .ok_or_else(|| format!("read past end of ROM at {off:#x}"))
 }
 
-fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String> {
+struct AxisDims {
+    stock_n: usize,
+    new_n: usize,
+}
+
+/// Validates and computes the shape of a seeded axis, without writing
+/// anything. Shared between `seed_axis` (which writes the bytes) and
+/// `validate_cross_record` / `validate_declared_sizes` (which only need the
+/// dimensions to cross-check against something else).
+fn axis_dims(rec: &SeedRecord, dst_len: usize, ori: &[u8]) -> Result<AxisDims, String> {
     let src = rec.src as usize;
     let stock_n = be16(ori, src + 4)? as usize;
 
-    if dst.len() < AXIS_HEADER || !(dst.len() - AXIS_HEADER).is_multiple_of(2) {
+    if dst_len < AXIS_HEADER || !(dst_len - AXIS_HEADER).is_multiple_of(2) {
         return Err(format!(
-            "seeded axis at {:#x} has size {}, which is not {AXIS_HEADER} + 2*n",
-            rec.dst,
-            dst.len()
+            "seeded axis at {:#x} has size {dst_len}, which is not {AXIS_HEADER} + 2*n",
+            rec.dst
         ));
     }
-    let new_n = (dst.len() - AXIS_HEADER) / 2;
+    let new_n = (dst_len - AXIS_HEADER) / 2;
 
     if stock_n < 2 {
         return Err(format!(
@@ -129,9 +217,18 @@ fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String>
             rec.dst
         ));
     }
+    Ok(AxisDims { stock_n, new_n })
+}
+
+fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String> {
+    let src = rec.src as usize;
+    let AxisDims { stock_n, new_n } = axis_dims(rec, dst.len(), ori)?;
 
     // Header: dst and src copied verbatim, size is the new one.
-    dst[0..4].copy_from_slice(&ori[src..src + 4]);
+    let hdr = ori
+        .get(src..src + 4)
+        .ok_or_else(|| format!("read past end of ROM at {src:#x}"))?;
+    dst[0..4].copy_from_slice(hdr);
     dst[4..6].copy_from_slice(&(new_n as u16).to_be_bytes());
 
     // Stock breakpoints.
@@ -165,9 +262,15 @@ fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String>
     Ok(())
 }
 
-const MAP3D8_HEADER: usize = 7;
+struct Map3d8Dims {
+    stock_xs: usize,
+    stock_ys: usize,
+    new_ys: usize,
+}
 
-fn seed_map3d8(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String> {
+/// Validates and computes the shape of a seeded 3dmap8, without writing
+/// anything. Shared between `seed_map3d8` and `validate_cross_record`.
+fn map3d8_dims(rec: &SeedRecord, dst_len: usize, ori: &[u8]) -> Result<Map3d8Dims, String> {
     let src = rec.src as usize;
     let yaxis = rec.src_yaxis as usize;
 
@@ -183,20 +286,25 @@ fn seed_map3d8(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), Strin
         return Err(format!("stock y-axis {yaxis:#x} declares size 0"));
     }
 
-    if dst.len() < MAP3D8_HEADER || !(dst.len() - MAP3D8_HEADER).is_multiple_of(stock_xs) {
+    if dst_len < MAP3D8_HEADER || !(dst_len - MAP3D8_HEADER).is_multiple_of(stock_xs) {
         return Err(format!(
-            "seeded map at {:#x} has size {}, which is not {MAP3D8_HEADER} + {stock_xs}*n",
-            rec.dst,
-            dst.len()
+            "seeded map at {:#x} has size {dst_len}, which is not {MAP3D8_HEADER} + {stock_xs}*n",
+            rec.dst
         ));
     }
-    let new_ys = (dst.len() - MAP3D8_HEADER) / stock_xs;
+    let new_ys = (dst_len - MAP3D8_HEADER) / stock_xs;
     if new_ys < stock_ys {
         return Err(format!(
             "seeded map at {:#x} has {new_ys} rows, fewer than stock's {stock_ys}",
             rec.dst
         ));
     }
+    Ok(Map3d8Dims { stock_xs, stock_ys, new_ys })
+}
+
+fn seed_map3d8(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String> {
+    let src = rec.src as usize;
+    let Map3d8Dims { stock_xs, stock_ys, new_ys } = map3d8_dims(rec, dst.len(), ori)?;
 
     // Header copied verbatim: type, offset, xsrc, ysrc, xsize.
     let hdr = ori

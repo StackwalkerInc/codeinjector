@@ -3,8 +3,10 @@
 
 import struct
 
-from fixtures_seed import (make_seed_elf, seed_record, SEED_KIND_AXIS,
-                           SEED_KIND_MAP3D8)
+from elf_builder import EM_SH
+from fixtures_seed import (make_seed_elf, make_multi_seed_elf,
+                           make_seed_with_desc_elf, seed_record,
+                           SEED_KIND_AXIS, SEED_KIND_MAP3D8)
 
 
 def test_unknown_seed_kind_is_rejected(run_ci):
@@ -24,6 +26,7 @@ def test_misaligned_seed_section_is_rejected(run_ci):
     )
     r, rom = run_ci('mmc-m32r', elf)
     assert r.returncode != 0
+    assert 'not a multiple of' in r.stderr
 
 
 def test_unapplied_seed_record_is_rejected(run_ci):
@@ -37,6 +40,19 @@ def test_unapplied_seed_record_is_rejected(run_ci):
     r, rom = run_ci('mmc-m32r', elf)
     assert r.returncode != 0
     assert 'seed' in r.stderr.lower()
+
+
+def test_seed_rejected_on_sh2(run_ci):
+    # data_seed is m32r-only; apply_records must reject it outright on
+    # mmc-sh2 rather than silently skip seeding.
+    elf = make_seed_elf(
+        records=[seed_record(kind=SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 16,
+        machine=EM_SH,
+    )
+    r, rom = run_ci('mmc-sh2', elf)
+    assert r.returncode != 0
+    assert 'data_seed is only supported on m32r' in r.stderr
 
 
 def _axis(dst, src, values):
@@ -87,6 +103,7 @@ def test_axis_seed_rejects_shrinking(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+    assert 'fewer than stock' in r.stderr
 
 
 def test_axis_seed_rejects_non_ascending_tail(binary, tmp_path):
@@ -99,6 +116,7 @@ def test_axis_seed_rejects_non_ascending_tail(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+    assert 'not ascending' in r.stderr
 
 
 def test_axis_seed_rejects_overflow(binary, tmp_path):
@@ -112,6 +130,7 @@ def test_axis_seed_rejects_overflow(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+    assert 'overflows u16' in r.stderr
 
 
 def test_axis_seed_rejects_single_entry_stock(binary, tmp_path):
@@ -124,6 +143,36 @@ def test_axis_seed_rejects_single_entry_stock(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+    assert 'need at least 2' in r.stderr
+
+
+def test_axis_seed_rejects_no_sized_symbol(binary, tmp_path):
+    from conftest import run
+    stock = _axis(dst=-1, src=-2, values=[10, 20, 30, 40])
+    rom = _rom_with(tmp_path, 0x3000, stock)
+    # The destination symbol exists at 0x2000 but declares st_size == 0,
+    # so symbol_size_at can't find a sized symbol there.
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 20, sym_size=0,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'no sized symbol' in r.stderr
+
+
+def test_axis_seed_rejects_overrunning_section(binary, tmp_path):
+    from conftest import run
+    stock = _axis(dst=-1, src=-2, values=[10, 20, 30, 40])
+    rom = _rom_with(tmp_path, 0x3000, stock)
+    # The destination symbol claims 32 bytes, but its section only holds 16.
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 16, sym_size=32,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'overruns its section' in r.stderr
 
 
 def _map3d8(type_, offset, xsrc, ysrc, xsize, rows):
@@ -181,6 +230,7 @@ def test_map_seed_rejects_indivisible_size(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+    assert 'which is not' in r.stderr
 
 
 def test_map_seed_rejects_shrinking(binary, tmp_path):
@@ -196,6 +246,126 @@ def test_map_seed_rejects_shrinking(binary, tmp_path):
     )
     r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
     assert r.returncode != 0
+    assert 'fewer than stock' in r.stderr
+
+
+def test_map_seed_rejects_xsize_zero(binary, tmp_path):
+    from conftest import run
+    # xsize byte in the stock map header is 0.
+    stock_map = _map3d8(3, 0, -1, -2, xsize=0, rows=[])
+    rom = _rom_with(tmp_path, 0x3000, stock_map)
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=0x3000,
+                             src_yaxis=0x3800)],
+        payload_addr=0x2000, payload=b'\x00' * 19,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'declares xsize 0' in r.stderr
+
+
+def test_map_seed_rejects_yaxis_size_zero(binary, tmp_path):
+    from conftest import run
+    stock_map = _map3d8(3, 0, -1, -2, xsize=3, rows=[[1, 2, 3], [4, 5, 6]])
+    # Stock y-axis declares 0 entries.
+    stock_axis = _axis(dst=-2, src=-3, values=[])
+    rom = _rom_with_many(tmp_path, [(0x3000, stock_map), (0x3800, stock_axis)])
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=0x3000,
+                             src_yaxis=0x3800)],
+        payload_addr=0x2000, payload=b'\x00' * 19,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'declares size 0' in r.stderr
+
+
+def test_map_seed_rejects_header_past_end_of_rom(binary, tmp_path):
+    from conftest import run
+    # Stock map header (7 bytes) starting at 0xA in a 16-byte ROM runs off
+    # the end before the xsize byte at offset +6 can even be read.
+    stock_map_at = 0xA
+    rom = _rom_with(tmp_path, stock_map_at, b'', size=0x10)
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=stock_map_at,
+                             src_yaxis=0)],
+        payload_addr=0x2000, payload=b'\x00' * 19,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'header runs past end of ROM' in r.stderr
+
+
+def test_map_seed_rejects_body_past_end_of_rom(binary, tmp_path):
+    from conftest import run
+    stock_axis_at, stock_map_at = 0x0, 0x10
+    stock_axis = _axis(dst=-1, src=-2, values=[10, 20])   # stock_ys = 2
+    # Header + exactly one xsize=3 row; the ROM ends right after it, so the
+    # second stock row (needed once y >= 1) runs past the end.
+    stock_map = _map3d8(3, 0, -1, -2, xsize=3, rows=[[1, 2, 3]])
+    rom = _rom_with_many(
+        tmp_path, [(stock_axis_at, stock_axis), (stock_map_at, stock_map)],
+        size=stock_map_at + len(stock_map))
+    # New map: same shape as stock (7 + 3*2 = 13 bytes) -- no shrink, no
+    # growth, but the clamped-replication read of stock row 1 still needs
+    # bytes that were never in the (truncated) ROM.
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_MAP3D8, dst=0x2000, src=stock_map_at,
+                             src_yaxis=stock_axis_at)],
+        payload_addr=0x2000, payload=b'\x00' * 13,
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'body runs past end of ROM' in r.stderr
+
+
+def test_axis_and_map_row_counts_must_agree(binary, tmp_path):
+    from conftest import run
+    stock_axis_at, stock_map_at = 0x3000, 0x3800
+    stock_axis = _axis(dst=-1, src=-2, values=[10, 20])
+    stock_map = _map3d8(3, 0, -1, -2, xsize=3, rows=[[1, 2, 3], [4, 5, 6]])
+    rom = _rom_with_many(tmp_path, [(stock_axis_at, stock_axis),
+                                    (stock_map_at, stock_map)])
+
+    # Both records seed from the same stock y-axis (stock_axis_at), so the
+    # ECU's calc_axis will index the map body with the axis's row index at
+    # runtime -- but the axis is seeded to 4 entries (6 + 2*4 = 14 bytes)
+    # while the map is seeded to 3 rows (7 + 3*3 = 16 bytes). The two
+    # macros in the C source disagree, and nothing else would catch it.
+    elf = make_multi_seed_elf(
+        records=[
+            seed_record(SEED_KIND_AXIS, dst=0x2000, src=stock_axis_at),
+            seed_record(SEED_KIND_MAP3D8, dst=0x2100, src=stock_map_at,
+                        src_yaxis=stock_axis_at),
+        ],
+        payloads=[
+            (0x2000, b'\x00' * 14, 'axis17'),
+            (0x2100, b'\x00' * 16, 'map4fb5c'),
+        ],
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert '0x2000' in r.stderr and '0x2100' in r.stderr
+    assert '4 entries' in r.stderr and '3 rows' in r.stderr
+
+
+def test_axis_declared_size_disagrees_with_symbol_size(binary, tmp_path):
+    from conftest import run
+    stock = _axis(dst=-1, src=-2, values=[10, 20, 30, 40])
+    rom = _rom_with(tmp_path, 0x3000, stock)
+    # Destination symbol is 20 bytes -> new_n = (20 - 6) / 2 = 7, but the
+    # data_desc descriptor for the same destination declares elements="8":
+    # the array literal that sizes the symbol and the descriptor's size
+    # argument were edited independently and now disagree.
+    elf = make_seed_with_desc_elf(
+        records=[seed_record(SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 20,
+        desc_str='axis;AxName;scl;8',
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'will hold 7 entries' in r.stderr
+    assert 'declares elements="8"' in r.stderr
 
 
 def test_seeded_bytes_appear_in_emitted_xml(binary, tmp_path):
