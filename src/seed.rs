@@ -101,8 +101,72 @@ pub fn apply_records(
     Ok(())
 }
 
-fn seed_axis(_rec: &SeedRecord, _dst: &mut [u8], _ori: &[u8]) -> Result<(), String> {
-    Err("axis seeding not implemented".to_string())
+const AXIS_HEADER: usize = 6;
+
+fn be16(buf: &[u8], off: usize) -> Result<u16, String> {
+    buf.get(off..off + 2)
+        .map(|s| u16::from_be_bytes([s[0], s[1]]))
+        .ok_or_else(|| format!("read past end of ROM at {off:#x}"))
+}
+
+fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String> {
+    let src = rec.src as usize;
+    let stock_n = be16(ori, src + 4)? as usize;
+
+    if dst.len() < AXIS_HEADER || !(dst.len() - AXIS_HEADER).is_multiple_of(2) {
+        return Err(format!(
+            "seeded axis at {:#x} has size {}, which is not {AXIS_HEADER} + 2*n",
+            rec.dst,
+            dst.len()
+        ));
+    }
+    let new_n = (dst.len() - AXIS_HEADER) / 2;
+
+    if stock_n < 2 {
+        return Err(format!(
+            "stock axis {src:#x} has {stock_n} entries; need at least 2 to extrapolate"
+        ));
+    }
+    if new_n < stock_n {
+        return Err(format!(
+            "seeded axis at {:#x} has {new_n} entries, fewer than stock's {stock_n}",
+            rec.dst
+        ));
+    }
+
+    // Header: dst and src copied verbatim, size is the new one.
+    dst[0..4].copy_from_slice(&ori[src..src + 4]);
+    dst[4..6].copy_from_slice(&(new_n as u16).to_be_bytes());
+
+    // Stock breakpoints.
+    for i in 0..stock_n {
+        let v = be16(ori, src + AXIS_HEADER + 2 * i)?;
+        dst[AXIS_HEADER + 2 * i..AXIS_HEADER + 2 * i + 2].copy_from_slice(&v.to_be_bytes());
+    }
+
+    // Extrapolated tail.
+    let last = be16(ori, src + AXIS_HEADER + 2 * (stock_n - 1))?;
+    let prev = be16(ori, src + AXIS_HEADER + 2 * (stock_n - 2))?;
+    if last <= prev {
+        return Err(format!(
+            "stock axis {src:#x} tail is not ascending ({prev} -> {last}); \
+             extrapolation would run backwards"
+        ));
+    }
+    let delta = u32::from(last - prev);
+    for i in stock_n..new_n {
+        let v = u32::from(last) + delta * (i - (stock_n - 1)) as u32;
+        if v > 0xffff {
+            return Err(format!(
+                "axis extrapolation for {:#x} overflows u16 at entry {i} ({v:#x}); \
+                 equal top entries would divide by zero in calc_axis",
+                rec.dst
+            ));
+        }
+        dst[AXIS_HEADER + 2 * i..AXIS_HEADER + 2 * i + 2]
+            .copy_from_slice(&(v as u16).to_be_bytes());
+    }
+    Ok(())
 }
 
 fn seed_map3d8(_rec: &SeedRecord, _dst: &mut [u8], _ori: &[u8]) -> Result<(), String> {
