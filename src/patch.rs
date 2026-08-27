@@ -62,28 +62,30 @@ fn print_patch_xml(
     println!("<scaling name=\"{scaling_name}\" storagetype=\"bloblist\">\n\t<data name=\"Original\" value=\"{original}\" />\n\t<data name=\"Patched\" value=\"{patched}\" />\n</scaling>\n\n<table name=\"{section_name}\" address=\"{patch_address:x}\" category=\"Patches\" type=\"1D\" scaling=\"{scaling_name}\" />\n");
 }
 
-fn encode_m32r_bl(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
+/// `bl` and `bra` differ only in opcode: both take a word-scaled, 24-bit
+/// pc-relative displacement to the `LONG(symbol)` payload.
+fn encode_m32r_branch(
+    data: &[u8],
+    vma: usize,
+    opcode: u32,
+    size_err: &'static str,
+) -> Result<[u8; 4], &'static str> {
     let target = data
         .try_into()
         .map(u32::from_be_bytes)
-        .map_err(|_| "Invalid bl injection instruction section size")?;
+        .map_err(|_| size_err)?;
 
     let offset = (target.wrapping_sub(vma as u32) >> 2) & 0x00ff_ffff;
-    let patch = 0xfe00_0000 | offset;
 
-    Ok(patch.to_be_bytes())
+    Ok((opcode | offset).to_be_bytes())
+}
+
+fn encode_m32r_bl(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
+    encode_m32r_branch(data, vma, 0xfe00_0000, "Invalid bl injection instruction section size")
 }
 
 fn encode_m32r_bra(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
-    let target = data
-        .try_into()
-        .map(u32::from_be_bytes)
-        .map_err(|_| "Invalid bra injection instruction section size")?;
-
-    let offset = (target.wrapping_sub(vma as u32) >> 2) & 0x00ff_ffff;
-    let patch = 0xff00_0000 | offset;
-
-    Ok(patch.to_be_bytes())
+    encode_m32r_branch(data, vma, 0xff00_0000, "Invalid bra injection instruction section size")
 }
 
 fn encode_m32r_ld24(data: &[u8], register_index: u32) -> Result<[u8; 4], &'static str> {

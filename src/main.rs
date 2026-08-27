@@ -10,6 +10,21 @@ use std::fs;
 use std::io::Write;
 use object::{Object, ObjectSection, ObjectSymbol, SectionFlags, SymbolKind};
 
+/// `Result::unwrap_or_else` specialised to this tool's failure mode: print
+/// the error and exit with the usage banner.
+pub(crate) trait OrDie<T> {
+    fn or_die(self) -> T;
+}
+
+impl<T, E: std::fmt::Display> OrDie<T> for Result<T, E> {
+    fn or_die(self) -> T {
+        self.unwrap_or_else(|e| {
+            eprintln!("{e}");
+            usage_and_exit();
+        })
+    }
+}
+
 pub(crate) fn usage_and_exit() -> ! {
     eprintln!("Usage: codeinjector ecu_name original_file injection_file [output_file]");
     eprintln!("\tecu_name - one of supported ecu names: mmc-sh2, mmc-m32r");
@@ -67,12 +82,7 @@ fn main() {
     for section in injection_file.sections() {
         match section.name().unwrap_or("") {
             "data_seed" => {
-                let parsed =
-                    seed::parse_records(section.data().unwrap_or(&[])).unwrap_or_else(|e| {
-                        eprintln!("{e}");
-                        usage_and_exit();
-                    });
-                seed_records.extend(parsed);
+                seed_records.extend(seed::parse_records(section.data().unwrap_or(&[])).or_die());
             }
             "data_desc" => {
                 axis_descriptors.extend(datadesc::collect_axis_descriptors(
@@ -89,22 +99,11 @@ fn main() {
     // Pre-pass: cross-check seed records against each other and against
     // data_desc, before any seeding is performed. Both are hard-fails
     // required by the seeding design spec -- see seed.rs for why.
-    seed::validate_cross_record(&seed_records, &symbols, &ori_buf).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        usage_and_exit();
-    });
-    seed::validate_declared_sizes(&seed_records, &symbols, &ori_buf, &axis_descriptors)
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            usage_and_exit();
-        });
-
-    // Tracks, across the whole section loop below, which seed records were
-    // ever applied to some section. A record whose `dst` lands in no
-    // injected section at all (e.g. a mis-wired linker script) would
-    // otherwise be silently dropped -- exit 0 with a ROM full of zeroed
-    // tables. That failure mode is checked for after the loop.
-    let mut seed_applied = vec![false; seed_records.len()];
+    let mut seeder = seed::Seeder::new(seed_records);
+    seeder.validate_cross_record(&symbols, &ori_buf).or_die();
+    seeder
+        .validate_declared_sizes(&symbols, &ori_buf, &axis_descriptors)
+        .or_die();
 
     // Pass 2: process sections.
     for section in injection_file.sections() {
@@ -138,19 +137,9 @@ fn main() {
         }
 
         let mut section_bytes = section_data.to_vec();
-        seed::apply_records(
-            &seed_records,
-            section.address(),
-            &mut section_bytes,
-            &symbols,
-            &ori_buf,
-            ecu,
-            &mut seed_applied,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            usage_and_exit();
-        });
+        seeder
+            .apply_to_section(section.address(), &mut section_bytes, &symbols, &ori_buf, ecu)
+            .or_die();
 
         patch::inject_section(
             &name,
@@ -162,11 +151,12 @@ fn main() {
         );
     }
 
-    let unapplied: Vec<String> = seed_records
-        .iter()
-        .zip(seed_applied.iter())
-        .filter(|(_, &applied)| !applied)
-        .map(|(rec, _)| format!("{:#x}", rec.dst))
+    // A record whose `dst` landed in no injected section at all (e.g. a
+    // mis-wired linker script) would otherwise be silently dropped -- exit 0
+    // with a ROM full of zeroed tables.
+    let unapplied: Vec<String> = seeder
+        .unapplied()
+        .map(|rec| format!("{:#x}", rec.dst))
         .collect();
     if !unapplied.is_empty() {
         eprintln!(
