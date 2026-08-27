@@ -93,35 +93,27 @@ pub fn collect_axis_descriptors(
     section_index: SectionIndex,
     symbols: &[SymInfo],
 ) -> Vec<AxisDescriptor> {
-    let mut out = Vec::new();
-    for sym in symbols
+    symbols
         .iter()
-        .filter(|s| s.section_index == Some(section_index) && !s.is_section_sym)
-    {
-        let desc_str = match get_data_desc_string(sym.address, section_addr, section_data) {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
-        };
-        if get_data_desc_type(&desc_str) != DataDescType::Axis {
-            continue;
-        }
-        let data_sym = match get_data_symbol(&sym.name, symbols) {
-            Some(s) => s,
-            None => continue,
-        };
-        let (_, _, size_str) = parse_axis_desc_fields(&desc_str);
-        let declared_size: usize = match size_str.parse() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        out.push(AxisDescriptor {
-            desc_symbol: sym.name.clone(),
-            data_symbol: data_sym.name.clone(),
-            data_addr: data_sym.address,
-            declared_size,
-        });
-    }
-    out
+        .filter_map(|sym| {
+            if sym.section_index != Some(section_index) || sym.is_section_sym {
+                return None;
+            }
+            let desc_str = get_data_desc_string(sym.address, section_addr, section_data)
+                .filter(|s| !s.is_empty())?;
+            if get_data_desc_type(&desc_str) != DataDescType::Axis {
+                return None;
+            }
+            let data_sym = get_data_symbol(&sym.name, symbols)?;
+            let (_, _, size_str) = parse_axis_desc_fields(&desc_str);
+            Some(AxisDescriptor {
+                desc_symbol: sym.name.clone(),
+                data_symbol: data_sym.name.clone(),
+                data_addr: data_sym.address,
+                declared_size: size_str.parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 fn get_axis_size(rom_addr: usize, ori_buf: &[u8], short_pointer_size: usize) -> u16 {
