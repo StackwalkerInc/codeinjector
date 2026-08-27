@@ -71,34 +71,51 @@ def make_multi_seed_elf(records, payloads, machine=EM_M32R):
 
 def make_seed_with_desc_elf(records, payload_addr, payload, desc_str,
                             payload_sym='seeded', desc_section_addr=0,
-                            machine=EM_M32R):
+                            machine=EM_M32R, desc_prefix='d_', extra_descs=()):
     """
     Build an ELF combining a data_seed record targeting `payload_sym` with a
     data_desc entry describing that same destination symbol.
 
     Per the data_desc convention (see fixtures_datadesc.py), the descriptor
     symbol's name is a 2-character prefix plus the data symbol's name, so the
-    descriptor symbol here is named 'd_' + payload_sym and its "data symbol"
-    (desc_sym[2:]) resolves back to payload_sym itself -- the very symbol the
-    seed record fills in.
+    descriptor symbol here is named `desc_prefix` + payload_sym and its "data
+    symbol" (desc_sym[2:]) resolves back to payload_sym itself -- the very
+    symbol the seed record fills in. `desc_prefix` is parameterised because
+    a prefix of 'dX' is what routes an axis through the axisex path.
+
+    extra_descs: further (desc_sym, desc_str, data_addr) descriptors sharing
+    the same data_desc section, for referencing the seeded one from a map.
     """
     b = ELFBuilder(machine)
     b.add_section('Seeded', payload, sh_type=SHT_PROGBITS,
                   sh_flags=SHF_ALLOC, sh_addr=payload_addr)
     b.add_section('data_seed', b''.join(records), sh_type=SHT_PROGBITS,
                   sh_flags=0, sh_addr=0)
-    data_desc_idx = b.add_section(
-        'data_desc', desc_str.encode() + b'\x00',
-        sh_type=SHT_PROGBITS, sh_flags=0, sh_addr=desc_section_addr)
 
-    desc_sym = 'd_' + payload_sym
-    strtab, off = _build_strtab([payload_sym, desc_sym])
+    desc_sym = desc_prefix + payload_sym
+    # Descriptor strings are laid out in order; each descriptor symbol's
+    # st_value is the address of its own string within the section.
+    descs = [(desc_sym, desc_str)] + [(n, s) for n, s, _ in extra_descs]
+    blob, desc_addrs = b'', {}
+    for name, text in descs:
+        desc_addrs[name] = desc_section_addr + len(blob)
+        blob += text.encode() + b'\x00'
+    data_desc_idx = b.add_section('data_desc', blob, sh_type=SHT_PROGBITS,
+                                  sh_flags=0, sh_addr=desc_section_addr)
+
+    extra_data = [(n[2:], a) for n, _, a in extra_descs]
+    strtab, off = _build_strtab([payload_sym, desc_sym]
+                               + [n for n, _, _ in extra_descs]
+                               + [n for n, _ in extra_data])
     strtab_idx = b.add_section('.strtab', strtab, sh_type=SHT_STRTAB,
                                sh_flags=0, sh_addralign=1)
     info = (STB_GLOBAL << 4) | STT_OBJECT
     symtab = pack_sym(0, 0, 0, 0, 0, 0)  # null symbol
     symtab += pack_sym(off[payload_sym], payload_addr, len(payload), info, 0, SHN_ABS)
-    symtab += pack_sym(off[desc_sym], desc_section_addr, 0, info, 0, data_desc_idx)
+    for name, _ in descs:
+        symtab += pack_sym(off[name], desc_addrs[name], 0, info, 0, data_desc_idx)
+    for name, addr in extra_data:
+        symtab += pack_sym(off[name], addr, 0, info, 0, SHN_ABS)
     b.add_section('.symtab', symtab, sh_type=SHT_SYMTAB, sh_flags=0,
                   sh_link=strtab_idx, sh_info=1, sh_entsize=SYM_SIZE)
     return b.build()

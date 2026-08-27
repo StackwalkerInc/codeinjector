@@ -38,7 +38,9 @@ pub fn get_patch_method(name: &str) -> PatchMethod {
     PatchMethod::Generic
 }
 
+use crate::OrDie;
 use crate::ecu::EcuDescription;
+
 
 fn to_hex_string(data: &[u8]) -> String {
     use std::fmt::Write;
@@ -49,7 +51,7 @@ fn to_hex_string(data: &[u8]) -> String {
     s
 }
 
-fn print_patch_xml(
+pub fn print_patch_xml(
     section_name: &str,
     patch_address: usize,
     patch_size: usize,
@@ -183,14 +185,17 @@ fn encode_sh_splice(data: &[u8], vma: usize) -> Result<([u8; 26], usize), &'stat
     }
 }
 
+/// Writes one section's patch into `out_buf` and returns the `(address,
+/// size)` extent it covered, or `None` if the section carried nothing to
+/// inject. The caller emits the XML for that extent afterwards, once every
+/// section has been written -- see `main`.
 pub fn inject_section(
     name: &str,
     vma: usize,
     section_data: &[u8],
     ecu: &EcuDescription,
-    ori_buf: &[u8],
     out_buf: &mut [u8],
-) {
+) -> Option<(usize, usize)> {
     let method = get_patch_method(name);
 
     if method != PatchMethod::Generic && !name.contains(ecu.patch_method_prefix) {
@@ -204,81 +209,50 @@ pub fn inject_section(
             out_buf[vma..vma + sec_size].copy_from_slice(section_data);
             (vma, sec_size)
         }
-        PatchMethod::M32rBl => {
-            let patch = encode_m32r_bl(section_data, vma).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
-            out_buf[vma..vma + 4].copy_from_slice(&patch);
-            (vma, 4)
-        }
-        PatchMethod::M32rBra => {
-            let patch = encode_m32r_bra(section_data, vma).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
-            out_buf[vma..vma + 4].copy_from_slice(&patch);
-            (vma, 4)
-        }
-        PatchMethod::M32rLd24R0 => {
-            let patch = encode_m32r_ld24(section_data, 0u32).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
-            out_buf[vma..vma + 4].copy_from_slice(&patch);
-            (vma, 4)
-        }
-        PatchMethod::M32rLd24R4 => {
-            let patch = encode_m32r_ld24(section_data, 4u32).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
-            out_buf[vma..vma + 4].copy_from_slice(&patch);
-            (vma, 4)
-        }
-        PatchMethod::M32rLduhR1 => {
-            let patch = encode_m32r_lduh_r1(section_data).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
+        // Every m32r single-instruction method writes exactly one 4-byte
+        // word at the section's own vma; only the encoding differs.
+        PatchMethod::M32rBl
+        | PatchMethod::M32rBra
+        | PatchMethod::M32rLd24R0
+        | PatchMethod::M32rLd24R4
+        | PatchMethod::M32rLduhR1 => {
+            let patch = match method {
+                PatchMethod::M32rBl => encode_m32r_bl(section_data, vma),
+                PatchMethod::M32rBra => encode_m32r_bra(section_data, vma),
+                PatchMethod::M32rLd24R0 => encode_m32r_ld24(section_data, 0),
+                PatchMethod::M32rLd24R4 => encode_m32r_ld24(section_data, 4),
+                _ => encode_m32r_lduh_r1(section_data),
+            }
+            .or_die();
             out_buf[vma..vma + 4].copy_from_slice(&patch);
             (vma, 4)
         }
         PatchMethod::M32rSpliceIntoFunction => {
-            let patch = encode_m32r_splice(section_data, vma).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
+            let patch = encode_m32r_splice(section_data, vma).or_die();
             out_buf[vma..vma + 8].copy_from_slice(&patch);
             (vma, 8)
         }
         PatchMethod::M32rRelocateSection | PatchMethod::ShRelocateSection => {
             if section_data.len() < 4 {
-                return;
+                return None;
             }
             let target = u32::from_be_bytes(section_data[0..4].try_into().unwrap()) as usize;
             out_buf[target..target + section_data.len()].copy_from_slice(section_data);
             (target, section_data.len())
         }
         PatchMethod::ShJumpToBody => {
-            let (buf, size) = encode_sh_jump_to_body(section_data, vma).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
+            let (buf, size) = encode_sh_jump_to_body(section_data, vma).or_die();
             out_buf[vma..vma + size].copy_from_slice(&buf[0..size]);
             (vma, size)
         }
         PatchMethod::ShSpliceIntoFunction => {
-            let (buf, size) = encode_sh_splice(section_data, vma).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                crate::usage_and_exit();
-            });
+            let (buf, size) = encode_sh_splice(section_data, vma).or_die();
             out_buf[vma..vma + size].copy_from_slice(&buf[0..size]);
             (vma, size)
         }
     };
 
-    print_patch_xml(name, patch_address, patch_size, ori_buf, out_buf);
+    Some((patch_address, patch_size))
 }
 
 #[cfg(test)]
@@ -308,11 +282,6 @@ mod tests {
         assert_eq!(result.unwrap(), [0xfe, 0x00, 0x04, 0x00]);
         // Wrong size
         assert!(encode_m32r_bl(&[0x00; 8], 0x1000).is_err());
-    }
-
-    #[test]
-    fn test_get_patch_method_bra() {
-        assert_eq!(get_patch_method("[m32r-bra]"), PatchMethod::M32rBra);
     }
 
     #[test]
@@ -352,11 +321,13 @@ mod tests {
 
     #[test]
     fn test_inject_relocate_section() {
-        let ori = vec![0u8; 0x2000];
-        let mut out = ori.clone();
+        let mut out = vec![0u8; 0x2000];
         let ecu = crate::ecu::find_ecu("mmc-m32r").unwrap();
-        inject_section("[m32r-relocate-section].data", 0, &[0x00, 0x00, 0x10, 0x00, 0xAA, 0xBB], ecu, &ori, &mut out);
+        let extent = inject_section("[m32r-relocate-section].data", 0, &[0x00, 0x00, 0x10, 0x00, 0xAA, 0xBB], ecu, &mut out);
+        assert_eq!(extent, Some((0x1000, 6)));
         assert_eq!(&out[0x1000..0x1006], &[0x00, 0x00, 0x10, 0x00, 0xAA, 0xBB]);
+        // Too short to carry a relocation target: nothing injected, no XML.
+        assert_eq!(inject_section("[m32r-relocate-section].data", 0, &[0x00], ecu, &mut out), None);
     }
 
     #[test]

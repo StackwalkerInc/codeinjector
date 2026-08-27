@@ -119,6 +119,22 @@ def test_axis_seed_rejects_non_ascending_tail(binary, tmp_path):
     assert 'not ascending' in r.stderr
 
 
+def test_axis_seed_same_size_copies_verbatim(binary, tmp_path):
+    from conftest import run
+    # No growth -> nothing to extrapolate, so a stock axis whose top two
+    # breakpoints repeat must still be copied verbatim rather than rejected.
+    stock = _axis(dst=-1, src=-2, values=[10, 20, 30, 30])
+    rom = _rom_with(tmp_path, 0x3000, stock)
+    elf = make_seed_elf(
+        records=[seed_record(SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 14,
+    )
+    r, romout = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode == 0, r.stderr
+    got = struct.unpack('>hhH4H', romout[0x2000:0x200e])
+    assert got == (-1, -2, 4, 10, 20, 30, 30)
+
+
 def test_axis_seed_rejects_overflow(binary, tmp_path):
     from conftest import run
     stock = _axis(dst=-1, src=-2, values=[0xff00, 0xff80])
@@ -382,3 +398,42 @@ def test_seeded_bytes_appear_in_emitted_xml(binary, tmp_path):
     assert r.returncode == 0, r.stderr
     patched_hex = romout[0x2000:0x2013].hex()
     assert patched_hex in r.stdout.replace('\n', '')
+
+
+def test_seeded_axis_declared_size_must_be_numeric(binary, tmp_path):
+    from conftest import run
+    stock = _axis(dst=-1, src=-2, values=[10, 20, 30, 40])
+    rom = _rom_with(tmp_path, 0x3000, stock)
+    # Descriptor with an empty size field. Nothing downstream can bound the
+    # table: it would reach EcuFlash as elements="". The seed cross-check is
+    # the only thing positioned to notice, so it must fail rather than skip
+    # the descriptor.
+    elf = make_seed_with_desc_elf(
+        records=[seed_record(SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 20,
+        desc_str='axis;AxName;scl;',
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode != 0
+    assert 'malformed size field' in r.stderr
+
+
+def test_axisex_elements_come_from_the_seeded_table(binary, tmp_path):
+    from conftest import run
+    stock = _axis(dst=-1, src=-2, values=[10, 20, 30, 40])
+    rom = _rom_with(tmp_path, 0x3000, stock)
+    # An axisex descriptor takes its element count from the described
+    # table's own header rather than from a literal. The table here is
+    # seeded into free space, so that header only exists in the *patched*
+    # ROM -- reading stock would report elements="0". 20 bytes -> 7 entries.
+    elf = make_seed_with_desc_elf(
+        records=[seed_record(SEED_KIND_AXIS, dst=0x2000, src=0x3000)],
+        payload_addr=0x2000, payload=b'\x00' * 20,
+        payload_sym='ax', desc_prefix='dX', desc_str='axisex;AxExName;ax_scl',
+        extra_descs=[('d_m8', '2dmap8;Cat;MapX;scl;dXax', 0x5000)],
+    )
+    r, _ = run(binary, 'mmc-m32r', rom, elf, tmp_path / 'o.bin', tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert 'AxExName' in r.stdout
+    assert 'elements="7"' in r.stdout
+    assert 'address="2006"' in r.stdout

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Aleksei Markelov
 
+use std::borrow::Cow;
+
 use crate::datadesc::{AxisDescriptor, SymInfo};
 use crate::ecu::EcuDescription;
 
@@ -61,7 +63,7 @@ fn symbol_size_at(addr: u32, symbols: &[SymInfo]) -> Result<usize, String> {
 /// record whose `dst` matches no injected section at all -- a mis-wired
 /// linker script -- would otherwise be silently dropped, shipping a ROM with
 /// a zeroed table and exit code 0. After the caller's section loop,
-/// `unapplied` reports exactly those records.
+/// `check_all_applied` reports exactly those records.
 pub struct Seeder {
     records: Vec<SeedRecord>,
     applied: Vec<bool>,
@@ -73,21 +75,30 @@ impl Seeder {
         Self { records, applied }
     }
 
-    /// Applies any record whose `dst` falls within `[section_addr,
-    /// section_addr + section_data.len())` to `section_data`, marking it
-    /// applied.
-    pub fn apply_to_section(
-        &mut self,
-        section_addr: u64,
-        section_data: &mut [u8],
-        symbols: &[SymInfo],
-        ori_buf: &[u8],
-        ecu: &EcuDescription,
-    ) -> Result<(), String> {
+    /// The table layouts `data_seed` knows (6-byte axis header, 7-byte
+    /// 3dmap8 header) are m32r's. Rejected up front, before any record is
+    /// interpreted, so other targets get this message rather than a
+    /// confusing complaint about an m32r layout.
+    pub fn check_arch(&self, ecu: &EcuDescription) -> Result<(), String> {
         if !self.records.is_empty() && ecu.short_pointer_size != 2 {
             return Err(format!("data_seed is only supported on m32r, not {}", ecu.name));
         }
-        let section_end = section_addr + section_data.len() as u64;
+        Ok(())
+    }
+
+    /// Applies any record whose `dst` falls within `[section_addr,
+    /// section_addr + section_data.len())` to `section_data`, marking it
+    /// applied. The section bytes are only cloned out of the ELF if some
+    /// record actually lands in them.
+    pub fn apply_to_section(
+        &mut self,
+        section_addr: u64,
+        section_data: &mut Cow<'_, [u8]>,
+        symbols: &[SymInfo],
+        ori_buf: &[u8],
+    ) -> Result<(), String> {
+        let section_len = section_data.len();
+        let section_end = section_addr + section_len as u64;
         for (rec, applied) in self.records.iter().zip(self.applied.iter_mut()) {
             let dst = u64::from(rec.dst);
             if dst < section_addr || dst >= section_end {
@@ -96,30 +107,38 @@ impl Seeder {
             *applied = true;
             let off = (dst - section_addr) as usize;
             let dst_len = symbol_size_at(rec.dst, symbols)?;
-            if off + dst_len > section_data.len() {
+            if off + dst_len > section_len {
                 return Err(format!(
                     "seed destination {:#x} (len {}) overruns its section",
                     rec.dst, dst_len
                 ));
             }
+            let dst_bytes = &mut section_data.to_mut()[off..off + dst_len];
             match rec.kind {
-                SEED_KIND_AXIS => seed_axis(rec, &mut section_data[off..off + dst_len], ori_buf)?,
-                SEED_KIND_MAP3D8 => {
-                    seed_map3d8(rec, &mut section_data[off..off + dst_len], ori_buf)?
-                }
+                SEED_KIND_AXIS => seed_axis(rec, dst_bytes, ori_buf)?,
+                SEED_KIND_MAP3D8 => seed_map3d8(rec, dst_bytes, ori_buf)?,
                 other => return Err(format!("unknown data_seed record kind {other}")),
             }
         }
         Ok(())
     }
 
-    /// The records that never landed in any injected section.
-    pub fn unapplied(&self) -> impl Iterator<Item = &SeedRecord> {
-        self.records
+    /// Fails if any record never landed in an injected section.
+    pub fn check_all_applied(&self) -> Result<(), String> {
+        let unapplied: Vec<String> = self
+            .records
             .iter()
             .zip(&self.applied)
             .filter(|(_, &applied)| !applied)
-            .map(|(rec, _)| rec)
+            .map(|(rec, _)| format!("{:#x}", rec.dst))
+            .collect();
+        if unapplied.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "data_seed record(s) never applied -- dst not in any injected section: {}",
+            unapplied.join(", ")
+        ))
     }
 
     /// Cross-checks `data_seed` records against each other, before any
@@ -175,20 +194,32 @@ impl Seeder {
         axis_descriptors: &[AxisDescriptor],
     ) -> Result<(), String> {
         for rec in self.records.iter().filter(|r| r.kind == SEED_KIND_AXIS) {
-            let describes = |d: &&AxisDescriptor| d.data_addr == u64::from(rec.dst);
-            if !axis_descriptors.iter().any(|d| describes(&d)) {
+            let mut described = axis_descriptors
+                .iter()
+                .filter(|d| d.data_addr == u64::from(rec.dst))
+                .peekable();
+            if described.peek().is_none() {
                 continue;
             }
-            let dst_len = symbol_size_at(rec.dst, symbols)?;
-            let dims = axis_dims(rec, dst_len, ori_buf)?;
-            for d in axis_descriptors.iter().filter(describes) {
-                if d.declared_size != dims.new_n {
+            let dims = axis_dims(rec, symbol_size_at(rec.dst, symbols)?, ori_buf)?;
+            for d in described {
+                // A missing or non-numeric size reaches the XML as
+                // elements="" -- unbounded as far as EcuFlash is concerned --
+                // so it fails here rather than being quietly skipped.
+                let declared: usize = d.declared_size.parse().map_err(|_| {
+                    format!(
+                        "data_desc descriptor {} for seeded axis at {:#x} (symbol {}) has \
+                         a malformed size field {:?}; it must be the element count",
+                        d.desc_symbol, rec.dst, d.data_symbol, d.declared_size
+                    )
+                })?;
+                if declared != dims.new_n {
                     return Err(format!(
                         "seeded axis at {:#x} (symbol {}) will hold {} entries, but its \
                          data_desc descriptor {} declares elements=\"{}\"; EcuFlash would \
                          edit past the end of the real table -- update the descriptor's \
                          size to match",
-                        rec.dst, d.data_symbol, dims.new_n, d.desc_symbol, d.declared_size
+                        rec.dst, d.data_symbol, dims.new_n, d.desc_symbol, declared
                     ));
                 }
             }
@@ -227,15 +258,18 @@ fn axis_dims(rec: &SeedRecord, dst_len: usize, ori: &[u8]) -> Result<AxisDims, S
     }
     let new_n = (dst_len - AXIS_HEADER) / 2;
 
-    if stock_n < 2 {
-        return Err(format!(
-            "stock axis {src:#x} has {stock_n} entries; need at least 2 to extrapolate"
-        ));
-    }
     if new_n < stock_n {
         return Err(format!(
             "seeded axis at {:#x} has {new_n} entries, fewer than stock's {stock_n}",
             rec.dst
+        ));
+    }
+    // Only a tail to fill needs the top two stock breakpoints; a same-size
+    // copy is just a verbatim copy and must not be rejected for a stock axis
+    // that is short or whose top entries repeat.
+    if new_n > stock_n && stock_n < 2 {
+        return Err(format!(
+            "stock axis {src:#x} has {stock_n} entries; need at least 2 to extrapolate"
         ));
     }
     Ok(AxisDims { stock_n, new_n })
@@ -258,6 +292,10 @@ fn seed_axis(rec: &SeedRecord, dst: &mut [u8], ori: &[u8]) -> Result<(), String>
         .get(stock_body..stock_body + 2 * stock_n)
         .ok_or_else(|| format!("read past end of ROM at {stock_body:#x}"))?;
     dst[AXIS_HEADER..AXIS_HEADER + 2 * stock_n].copy_from_slice(stock);
+
+    if new_n == stock_n {
+        return Ok(());
+    }
 
     // Extrapolated tail. `dst` is AXIS_HEADER + 2*new_n bytes by axis_dims,
     // so `entries` is exactly the new_n breakpoint slots.

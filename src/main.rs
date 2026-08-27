@@ -6,6 +6,7 @@ mod ecu;
 mod patch;
 mod seed;
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::Write;
 use object::{Object, ObjectSection, ObjectSymbol, SectionFlags, SymbolKind};
@@ -23,6 +24,14 @@ impl<T, E: std::fmt::Display> OrDie<T> for Result<T, E> {
             usage_and_exit();
         })
     }
+}
+
+/// One queued piece of XML output: either the `<scaling>`/`<table>` pair for
+/// an injected section (by patch extent), or a whole `data_desc` section to
+/// walk. Queued in section order during injection, printed afterwards.
+enum Emission<'a> {
+    Patch(String, usize, usize),
+    Desc(&'a [u8], u64, object::SectionIndex),
 }
 
 pub(crate) fn usage_and_exit() -> ! {
@@ -71,7 +80,7 @@ fn main() {
             is_section_sym: s.kind() == SymbolKind::Section,
         })
         .collect();
-    symbols.sort_unstable_by_key(|s| s.name.clone());
+    symbols.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
     // Pass 1: collect seed records, and the axis descriptors from data_desc
     // sections that seed records will be cross-checked against. Seed records
@@ -100,12 +109,18 @@ fn main() {
     // data_desc, before any seeding is performed. Both are hard-fails
     // required by the seeding design spec -- see seed.rs for why.
     let mut seeder = seed::Seeder::new(seed_records);
+    seeder.check_arch(ecu).or_die();
     seeder.validate_cross_record(&symbols, &ori_buf).or_die();
     seeder
         .validate_declared_sizes(&symbols, &ori_buf, &axis_descriptors)
         .or_die();
 
-    // Pass 2: process sections.
+    // Pass 2: inject sections. XML emission is deferred to pass 3 -- an
+    // `axisex` descriptor reads its element count out of the described
+    // table's own header, which for a table injected into free space only
+    // exists once every section has been written. Emissions are queued in
+    // section order so the XML comes out in the same order as before.
+    let mut emissions: Vec<Emission> = Vec::new();
     for section in injection_file.sections() {
         let name = match section.name() {
             Ok(n) => n.to_string(),
@@ -114,7 +129,7 @@ fn main() {
         let section_data = section.data().unwrap_or(&[]);
 
         if name == "data_desc" {
-            datadesc::process_section(section_data, section.address(), section.index(), &symbols, ecu, &ori_buf);
+            emissions.push(Emission::Desc(section_data, section.address(), section.index()));
             continue;
         }
         if name == "data_seed" {
@@ -136,34 +151,33 @@ fn main() {
             continue;
         }
 
-        let mut section_bytes = section_data.to_vec();
+        let mut section_bytes = Cow::Borrowed(section_data);
         seeder
-            .apply_to_section(section.address(), &mut section_bytes, &symbols, &ori_buf, ecu)
+            .apply_to_section(section.address(), &mut section_bytes, &symbols, &ori_buf)
             .or_die();
 
-        patch::inject_section(
-            &name,
-            section.address() as usize,
-            &section_bytes,
-            ecu,
-            &ori_buf,
-            &mut out_buf,
-        );
+        if let Some((addr, size)) =
+            patch::inject_section(&name, section.address() as usize, &section_bytes, ecu, &mut out_buf)
+        {
+            emissions.push(Emission::Patch(name, addr, size));
+        }
     }
 
     // A record whose `dst` landed in no injected section at all (e.g. a
     // mis-wired linker script) would otherwise be silently dropped -- exit 0
     // with a ROM full of zeroed tables.
-    let unapplied: Vec<String> = seeder
-        .unapplied()
-        .map(|rec| format!("{:#x}", rec.dst))
-        .collect();
-    if !unapplied.is_empty() {
-        eprintln!(
-            "data_seed record(s) never applied -- dst not in any injected section: {}",
-            unapplied.join(", ")
-        );
-        usage_and_exit();
+    seeder.check_all_applied().or_die();
+
+    // Pass 3: emit the XML, now that `out_buf` is the finished ROM.
+    for emission in emissions {
+        match emission {
+            Emission::Patch(name, addr, size) => {
+                patch::print_patch_xml(&name, addr, size, &ori_buf, &out_buf)
+            }
+            Emission::Desc(data, addr, index) => {
+                datadesc::process_section(data, addr, index, &symbols, ecu, &out_buf)
+            }
+        }
     }
 
     if args.len() > 4 {
