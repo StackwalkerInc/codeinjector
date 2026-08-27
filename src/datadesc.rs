@@ -7,6 +7,7 @@ use crate::ecu::EcuDescription;
 pub struct SymInfo {
     pub name: String,
     pub address: u64,
+    pub size: u64,
     pub section_index: Option<SectionIndex>,
     pub is_section_sym: bool,
 }
@@ -58,12 +59,75 @@ fn get_data_desc_type(s: &str) -> DataDescType {
     }
 }
 
-fn get_axis_size(rom_addr: usize, ori_buf: &[u8], short_pointer_size: usize) -> u16 {
+/// Splits a plain `axis;<username>;<scaling>;<size>` descriptor string into
+/// its `(name, scaling, size)` fields. Shared by `emit_axis_desc` (which
+/// prints them) and `collect_axis_descriptors` (which cross-checks the size
+/// against the destination symbol's actual storage).
+fn parse_axis_desc_fields(s: &str) -> (&str, &str, &str) {
+    let mut p = s.splitn(5, ';');
+    p.next(); // "axis"
+    let name = p.next().unwrap_or("");
+    let scl = p.next().unwrap_or("");
+    let size = p.next().unwrap_or("");
+    (name, scl, size)
+}
+
+/// One `axis;...` entry found in a `data_desc` section: the descriptor
+/// symbol and the data symbol it describes, plus the element count the
+/// descriptor string declares (this is what reaches the emitted EcuFlash XML
+/// as `elements="N"`).
+///
+/// `declared_size` is kept as the raw field text rather than a parsed count:
+/// a missing or non-numeric size is exactly the malformed descriptor the
+/// seed cross-check exists to catch, so dropping it here would let it slip
+/// through to the XML as `elements=""`. It is parsed -- and rejected -- at
+/// the point of use, in `Seeder::validate_declared_sizes`.
+pub struct AxisDescriptor {
+    pub desc_symbol: String,
+    pub data_symbol: String,
+    pub data_addr: u64,
+    pub declared_size: String,
+}
+
+/// Scans a `data_desc` section for plain `axis` (not `axisex`) descriptors
+/// and returns their declared sizes. `axisex` descriptors have no literal
+/// size field -- their size is read back from the ROM instead -- so they are
+/// not represented here.
+pub fn collect_axis_descriptors(
+    section_data: &[u8],
+    section_addr: u64,
+    section_index: SectionIndex,
+    symbols: &[SymInfo],
+) -> Vec<AxisDescriptor> {
+    symbols
+        .iter()
+        .filter_map(|sym| {
+            if sym.section_index != Some(section_index) || sym.is_section_sym {
+                return None;
+            }
+            let desc_str = get_data_desc_string(sym.address, section_addr, section_data)
+                .filter(|s| !s.is_empty())?;
+            if get_data_desc_type(&desc_str) != DataDescType::Axis {
+                return None;
+            }
+            let data_sym = get_data_symbol(&sym.name, symbols)?;
+            let (_, _, size_str) = parse_axis_desc_fields(&desc_str);
+            Some(AxisDescriptor {
+                desc_symbol: sym.name.clone(),
+                data_symbol: data_sym.name.clone(),
+                data_addr: data_sym.address,
+                declared_size: size_str.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn get_axis_size(rom_addr: usize, rom_buf: &[u8], short_pointer_size: usize) -> u16 {
     let offset = rom_addr + 2 * short_pointer_size;
-    if offset + 2 > ori_buf.len() {
+    if offset + 2 > rom_buf.len() {
         return 0;
     }
-    u16::from_be_bytes([ori_buf[offset], ori_buf[offset + 1]])
+    u16::from_be_bytes([rom_buf[offset], rom_buf[offset + 1]])
 }
 
 fn emit_value_data_desc(s: &str, data_addr: u64) {
@@ -105,7 +169,7 @@ fn emit_axis_ex_desc(
     symbols: &[SymInfo],
     section_addr: u64,
     section_data: &[u8],
-    ori_buf: &[u8],
+    rom_buf: &[u8],
     short_pointer_size: usize,
 ) {
     let desc_sym = get_symbol(axis_sym_name, symbols);
@@ -118,7 +182,7 @@ fn emit_axis_ex_desc(
                 p.next();
                 let name = p.next().unwrap_or("");
                 let scl  = p.next().unwrap_or("");
-                let axis_size = get_axis_size(da.address as usize, ori_buf, short_pointer_size);
+                let axis_size = get_axis_size(da.address as usize, rom_buf, short_pointer_size);
                 let axis_header = 2 * short_pointer_size + 2;
                 let addr = da.address as usize + axis_header;
                 println!("\t<table name=\"{name}\" type=\"{axis_type} Axis\" address=\"{addr:x}\" elements=\"{axis_size}\" scaling=\"{scl}\"/>");
@@ -136,11 +200,11 @@ fn emit_axis_desc(
     symbols: &[SymInfo],
     section_addr: u64,
     section_data: &[u8],
-    ori_buf: &[u8],
+    rom_buf: &[u8],
     short_pointer_size: usize,
 ) {
     if axis_sym_name.as_bytes().get(1) == Some(&b'X') {
-        emit_axis_ex_desc(axis_sym_name, axis_type, symbols, section_addr, section_data, ori_buf, short_pointer_size);
+        emit_axis_ex_desc(axis_sym_name, axis_type, symbols, section_addr, section_data, rom_buf, short_pointer_size);
         return;
     }
 
@@ -150,11 +214,7 @@ fn emit_axis_desc(
     match (desc_sym, data_sym) {
         (Some(ds), Some(da)) => {
             if let Some(str_val) = get_data_desc_string(ds.address, section_addr, section_data) {
-                let mut p = str_val.splitn(5, ';');
-                p.next();
-                let name  = p.next().unwrap_or("");
-                let scl   = p.next().unwrap_or("");
-                let size  = p.next().unwrap_or("");
+                let (name, scl, size) = parse_axis_desc_fields(&str_val);
                 let axis_header = 2 * short_pointer_size + 2;
                 let addr = da.address as usize + axis_header;
                 println!("\t<table name=\"{name}\" type=\"{axis_type} Axis\" address=\"{addr:x}\" elements=\"{size}\" scaling=\"{scl}\"/>");
@@ -172,7 +232,7 @@ fn emit_2dmap_data_desc(
     symbols: &[SymInfo],
     section_addr: u64,
     section_data: &[u8],
-    ori_buf: &[u8],
+    rom_buf: &[u8],
     short_pointer_size: usize,
 ) {
     let mut p = s.splitn(6, ';');
@@ -183,7 +243,7 @@ fn emit_2dmap_data_desc(
     let axisname = p.next().unwrap_or("");
     let addr = data_addr as u32;
     println!("<table name=\"{name}\" category=\"{cat}\" address=\"{addr:x}\" type=\"2D\" scaling=\"{scl}\">");
-    emit_axis_desc(axisname, "Y", symbols, section_addr, section_data, ori_buf, short_pointer_size);
+    emit_axis_desc(axisname, "Y", symbols, section_addr, section_data, rom_buf, short_pointer_size);
     println!("</table>\n");
 }
 
@@ -193,7 +253,7 @@ fn emit_3dmap_data_desc(
     symbols: &[SymInfo],
     section_addr: u64,
     section_data: &[u8],
-    ori_buf: &[u8],
+    rom_buf: &[u8],
     short_pointer_size: usize,
 ) {
     let mut p = s.splitn(7, ';');
@@ -205,18 +265,25 @@ fn emit_3dmap_data_desc(
     let yaxisname = p.next().unwrap_or("");
     let addr = data_addr as u32;
     println!("<table name=\"{name}\" category=\"{cat}\" address=\"{addr:x}\" type=\"3D\" scaling=\"{scl}\" swapxy=\"true\">");
-    emit_axis_desc(xaxisname, "X", symbols, section_addr, section_data, ori_buf, short_pointer_size);
-    emit_axis_desc(yaxisname, "Y", symbols, section_addr, section_data, ori_buf, short_pointer_size);
+    emit_axis_desc(xaxisname, "X", symbols, section_addr, section_data, rom_buf, short_pointer_size);
+    emit_axis_desc(yaxisname, "Y", symbols, section_addr, section_data, rom_buf, short_pointer_size);
     println!("</table>\n");
 }
 
+/// Emits the EcuFlash XML for one `data_desc` section.
+///
+/// `rom_buf` must be the *patched* ROM, not the stock one: an `axisex`
+/// descriptor reads its element count out of the described table's own
+/// header, and for a table injected into free space that header only exists
+/// after injection -- stock would read back erased flash. Callers therefore
+/// defer this until every section has been injected.
 pub fn process_section(
     section_data: &[u8],
     section_addr: u64,
     section_index: SectionIndex,
     symbols: &[SymInfo],
     ecu: &EcuDescription,
-    ori_buf: &[u8],
+    rom_buf: &[u8],
 ) {
     let ptr = ecu.short_pointer_size;
 
@@ -245,10 +312,10 @@ pub fn process_section(
             DataDescType::Value   => emit_value_data_desc(&desc_str, da),
             DataDescType::Array   => emit_array_data_desc(&desc_str, da),
             DataDescType::Array3D => emit_3darray_data_desc(&desc_str, da),
-            DataDescType::Map3D8  => emit_3dmap_data_desc(&desc_str, da + (3 + 2*ptr) as u64, symbols, section_addr, section_data, ori_buf, ptr),
-            DataDescType::Map3D16 => emit_3dmap_data_desc(&desc_str, da + (6 + 2*ptr) as u64, symbols, section_addr, section_data, ori_buf, ptr),
-            DataDescType::Map2D8  => emit_2dmap_data_desc(&desc_str, da + (2 + ptr) as u64,   symbols, section_addr, section_data, ori_buf, ptr),
-            DataDescType::Map2D16 => emit_2dmap_data_desc(&desc_str, da + (4 + ptr) as u64,   symbols, section_addr, section_data, ori_buf, ptr),
+            DataDescType::Map3D8  => emit_3dmap_data_desc(&desc_str, da + (3 + 2*ptr) as u64, symbols, section_addr, section_data, rom_buf, ptr),
+            DataDescType::Map3D16 => emit_3dmap_data_desc(&desc_str, da + (6 + 2*ptr) as u64, symbols, section_addr, section_data, rom_buf, ptr),
+            DataDescType::Map2D8  => emit_2dmap_data_desc(&desc_str, da + (2 + ptr) as u64,   symbols, section_addr, section_data, rom_buf, ptr),
+            DataDescType::Map2D16 => emit_2dmap_data_desc(&desc_str, da + (4 + ptr) as u64,   symbols, section_addr, section_data, rom_buf, ptr),
             DataDescType::Axis | DataDescType::AxisEx => { /* skipped explicitly */ }
             DataDescType::Unknown => { let name = &sym.name; println!("<comment name=\"{name}\">{desc_str}</comment>"); }
         }

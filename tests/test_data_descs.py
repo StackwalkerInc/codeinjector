@@ -193,3 +193,17 @@ def test_axis_missing_symbols(binary, rom, out, tmp_path):
     assert r.returncode == 0
     # emit_axis_desc falls back to: <table name="d_Zmissing" type="Y Axis"/>
     assert 'd_Zmissing' in r.stdout
+
+
+def test_malformed_axis_size_without_seeding_is_left_alone(binary, rom, out, tmp_path):
+    """An axis descriptor with a non-numeric size is only a hard error when a
+    data_seed record fills that table (see test_seed.py). Without seeding
+    there is nothing to cross-check it against, and existing ROM builds rely
+    on the descriptor still being emitted."""
+    descriptors = [
+        {'desc_sym': 'd_m8',  'desc_str': '2dmap8;Cat;Map8;map_scl;d_ax8', 'data_addr': 0x2000},
+        {'desc_sym': 'd_ax8', 'desc_str': 'axis;AxName;ax_scl;',           'data_addr': 0x3000},
+    ]
+    r = _run_datadesc(binary, rom, out, tmp_path, descriptors)
+    assert r.returncode == 0
+    assert 'elements=""' in r.stdout

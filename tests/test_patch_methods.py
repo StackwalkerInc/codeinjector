@@ -5,7 +5,7 @@ import struct
 import subprocess
 import pytest
 from fixtures_patch import (
-    make_m32r_bl_elf, make_m32r_ld24_r0_elf, make_m32r_ld24_r4_elf,
+    make_m32r_bl_elf, make_m32r_bra_elf, make_m32r_ld24_r0_elf, make_m32r_ld24_r4_elf,
     make_m32r_lduh_r1_elf, make_m32r_splice_elf, make_m32r_relocate_elf,
     make_sh_jump_to_body_elf, make_sh_splice_elf, make_sh_relocate_elf,
     make_generic_patch_elf, make_invalid_size_elf,
@@ -22,6 +22,21 @@ def test_m32r_bl(run_ci):
     assert rom[0x1000:0x1004] == bytes([0xfe, 0x00, 0x04, 0x00])
     assert '<scaling name="[m32r-bl] _scaling"' in r.stdout
     assert '<table name="[m32r-bl]"' in r.stdout
+
+
+def test_m32r_bra(run_ci):
+    r, rom = run_ci('mmc-m32r', make_m32r_bra_elf(vma=0x1000, target=0x2000))
+    assert r.returncode == 0
+    # BRA: 0xff000000 + ((0x2000 - 0x1000) / 4) = 0xff000400
+    assert rom[0x1000:0x1004] == bytes([0xff, 0x00, 0x04, 0x00])
+    assert '<table name="[m32r-bra]"' in r.stdout
+
+
+def test_m32r_bra_backward(run_ci):
+    r, rom = run_ci('mmc-m32r', make_m32r_bra_elf(vma=0x2000, target=0x1000))
+    assert r.returncode == 0
+    # (0x1000 - 0x2000) / 4 = -0x400, masked to 24 bits = 0xfffc00
+    assert rom[0x2000:0x2004] == bytes([0xff, 0xff, 0xfc, 0x00])
 
 
 def test_m32r_ld24_r0(run_ci):
