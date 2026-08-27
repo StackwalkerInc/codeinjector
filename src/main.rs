@@ -30,7 +30,7 @@ impl<T, E: std::fmt::Display> OrDie<T> for Result<T, E> {
 /// an injected section (by patch extent), or a whole `data_desc` section to
 /// walk. Queued in section order during injection, printed afterwards.
 enum Emission<'a> {
-    Patch(String, usize, usize),
+    Patch(&'a str, usize, usize),
     Desc(&'a [u8], u64, object::SectionIndex),
 }
 
@@ -120,48 +120,40 @@ fn main() {
     // table's own header, which for a table injected into free space only
     // exists once every section has been written. Emissions are queued in
     // section order so the XML comes out in the same order as before.
-    let mut emissions: Vec<Emission> = Vec::new();
-    for section in injection_file.sections() {
-        let name = match section.name() {
-            Ok(n) => n.to_string(),
-            Err(_) => continue,
-        };
-        let section_data = section.data().unwrap_or(&[]);
+    let emissions: Vec<Emission> = injection_file
+        .sections()
+        .filter_map(|section| {
+            let name = section.name().ok()?;
+            let section_data = section.data().unwrap_or(&[]);
 
-        if name == "data_desc" {
-            emissions.push(Emission::Desc(section_data, section.address(), section.index()));
-            continue;
-        }
-        if name == "data_seed" {
-            continue;
-        }
+            if name == "data_desc" {
+                return Some(Emission::Desc(section_data, section.address(), section.index()));
+            }
 
-        // Skip sections without SHF_ALLOC (mirrors SEC_LOAD check)
-        let loadable = match section.flags() {
-            SectionFlags::Elf { sh_flags } => sh_flags & u64::from(object::elf::SHF_ALLOC) != 0,
-            _ => false,
-        };
-        if !loadable {
-            continue;
-        }
+            // Not patches: data_seed (consumed above), sections without
+            // SHF_ALLOC, and uninitialized ones (SHT_NOBITS / COMMON
+            // allocations in RAM). The latter two mirror libbfd's SEC_LOAD
+            // check -- a section with no file content is not a patch.
+            let loadable = matches!(section.flags(),
+                SectionFlags::Elf { sh_flags } if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0);
+            if name == "data_seed"
+                || !loadable
+                || section.kind() == object::SectionKind::UninitializedData
+            {
+                return None;
+            }
 
-        // Skip uninitialized sections (SHT_NOBITS / COMMON allocations in RAM).
-        // Matches libbfd SEC_LOAD behaviour: sections with no file content are not patches.
-        if section.kind() == object::SectionKind::UninitializedData {
-            continue;
-        }
+            let mut section_bytes = Cow::Borrowed(section_data);
+            seeder
+                .apply_to_section(section.address(), &mut section_bytes, &symbols, &ori_buf)
+                .or_die();
 
-        let mut section_bytes = Cow::Borrowed(section_data);
-        seeder
-            .apply_to_section(section.address(), &mut section_bytes, &symbols, &ori_buf)
-            .or_die();
-
-        if let Some((addr, size)) =
-            patch::inject_section(&name, section.address() as usize, &section_bytes, ecu, &mut out_buf)
-        {
-            emissions.push(Emission::Patch(name, addr, size));
-        }
-    }
+            let vma = section.address() as usize;
+            let (addr, size) =
+                patch::inject_section(name, vma, &section_bytes, ecu, &mut out_buf)?;
+            Some(Emission::Patch(name, addr, size))
+        })
+        .collect();
 
     // A record whose `dst` landed in no injected section at all (e.g. a
     // mis-wired linker script) would otherwise be silently dropped -- exit 0
@@ -172,7 +164,7 @@ fn main() {
     for emission in emissions {
         match emission {
             Emission::Patch(name, addr, size) => {
-                patch::print_patch_xml(&name, addr, size, &ori_buf, &out_buf)
+                patch::print_patch_xml(name, addr, size, &ori_buf, &out_buf)
             }
             Emission::Desc(data, addr, index) => {
                 datadesc::process_section(data, addr, index, &symbols, ecu, &out_buf)
