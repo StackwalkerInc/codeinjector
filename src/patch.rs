@@ -72,16 +72,13 @@ fn encode_m32r_bl(data: &[u8], vma: usize) -> Result<[u8; 4], &'static str> {
     Ok(patch.to_be_bytes())
 }
 
-fn encode_m32r_ld24(data: &[u8], r4: bool) -> Result<[u8; 4], &'static str> {
+fn encode_m32r_ld24(data: &[u8], register_index: u32) -> Result<[u8; 4], &'static str> {
     let target = data
         .try_into()
         .map(u32::from_be_bytes)
         .map_err(|_| "Invalid ld24 injection instruction section size")?;
 
-    let mut patch = 0xe000_0000u32.wrapping_add(target);
-    if r4 {
-        patch = patch.wrapping_add(4u32 << 24);
-    }
+    let patch = 0xe000_0000u32 | (register_index << 24) | target;
     Ok(patch.to_be_bytes())
 }
 
@@ -100,9 +97,9 @@ fn encode_m32r_lduh_r1(data: &[u8]) -> Result<[u8; 4], &'static str> {
 }
 
 fn encode_m32r_splice(data: &[u8], vma: usize) -> Result<[u8; 8], &'static str> {
-    if data.len() < 8 {
-        return Err("Invalid splice injection section size");
-    }
+    let data: &[u8; 8] = data
+        .try_into()
+        .map_err(|_| "Invalid splice injection section size")?;
     let target1 = u32::from_be_bytes(data[0..4].try_into().unwrap());
     let target2 = u32::from_be_bytes(data[4..8].try_into().unwrap());
     let pc1 = vma as u32;
@@ -121,9 +118,9 @@ fn encode_m32r_splice(data: &[u8], vma: usize) -> Result<[u8; 8], &'static str> 
 
 // Returns (buf, total_patch_size). buf is 14 bytes max; only buf[..size] is valid.
 fn encode_sh_jump_to_body(data: &[u8], vma: usize) -> Result<([u8; 14], usize), &'static str> {
-    if data.len() < 4 {
-        return Err("Invalid jump-to-body injection instruction section size");
-    }
+    let data: &[u8; 4] = data
+        .try_into()
+        .map_err(|_| "Invalid jump-to-body injection instruction section size")?;
     let nop_prefix = match vma % 4 {
         2 => true,
         0 => false,
@@ -134,20 +131,20 @@ fn encode_sh_jump_to_body(data: &[u8], vma: usize) -> Result<([u8; 14], usize), 
     if nop_prefix {
         buf[0..2].copy_from_slice(&[0x00, 0x09]);
         buf[2..10].copy_from_slice(&static_body);
-        buf[10..14].copy_from_slice(&data[0..4]);
+        buf[10..14].copy_from_slice(data);
         Ok((buf, 14))
     } else {
         buf[0..8].copy_from_slice(&static_body);
-        buf[8..12].copy_from_slice(&data[0..4]);
+        buf[8..12].copy_from_slice(data);
         Ok((buf, 12))
     }
 }
 
 // Returns (buf, total_patch_size). buf is 26 bytes max; only buf[..size] is valid.
 fn encode_sh_splice(data: &[u8], vma: usize) -> Result<([u8; 26], usize), &'static str> {
-    if data.len() < 8 {
-        return Err("Invalid splice injection section size");
-    }
+    let data: &[u8; 8] = data
+        .try_into()
+        .map_err(|_| "Invalid splice injection section size")?;
     let nop_prefix = match vma % 4 {
         2 => true,
         0 => false,
@@ -161,11 +158,11 @@ fn encode_sh_splice(data: &[u8], vma: usize) -> Result<([u8; 26], usize), &'stat
     if nop_prefix {
         buf[0..2].copy_from_slice(&[0x00, 0x09]);
         buf[2..18].copy_from_slice(&static_body);
-        buf[18..26].copy_from_slice(&data[0..8]);
+        buf[18..26].copy_from_slice(data);
         Ok((buf, 26))
     } else {
         buf[0..16].copy_from_slice(&static_body);
-        buf[16..24].copy_from_slice(&data[0..8]);
+        buf[16..24].copy_from_slice(data);
         Ok((buf, 24))
     }
 }
@@ -200,7 +197,7 @@ pub fn inject_section(
             (vma, 4)
         }
         PatchMethod::M32rLd24R0 => {
-            let patch = encode_m32r_ld24(section_data, false).unwrap_or_else(|e| {
+            let patch = encode_m32r_ld24(section_data, 0u32).unwrap_or_else(|e| {
                 eprintln!("{}", e);
                 crate::usage_and_exit();
             });
@@ -208,7 +205,7 @@ pub fn inject_section(
             (vma, 4)
         }
         PatchMethod::M32rLd24R4 => {
-            let patch = encode_m32r_ld24(section_data, true).unwrap_or_else(|e| {
+            let patch = encode_m32r_ld24(section_data, 4u32).unwrap_or_else(|e| {
                 eprintln!("{}", e);
                 crate::usage_and_exit();
             });
@@ -291,9 +288,9 @@ mod tests {
     #[test]
     fn test_encode_m32r_ld24() {
         // target=0x1234 → r0: 0xe0001234, r4: 0xe4001234
-        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], false).unwrap(), [0xe0, 0x00, 0x12, 0x34]);
-        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], true).unwrap(),  [0xe4, 0x00, 0x12, 0x34]);
-        assert!(encode_m32r_ld24(&[0x00; 8], false).is_err());
+        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], 0u32).unwrap(), [0xe0, 0x00, 0x12, 0x34]);
+        assert_eq!(encode_m32r_ld24(&[0x00, 0x00, 0x12, 0x34], 4u32).unwrap(),  [0xe4, 0x00, 0x12, 0x34]);
+        assert!(encode_m32r_ld24(&[0x00; 8], 0u32).is_err());
     }
 
     #[test]
