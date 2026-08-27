@@ -25,7 +25,9 @@ pub fn parse_records(section_data: &[u8]) -> Result<Vec<SeedRecord>, String> {
     }
     let word = |c: &[u8], i: usize| u32::from_be_bytes(c[i * 4..i * 4 + 4].try_into().unwrap());
     Ok(section_data
-        .chunks_exact(SEED_RECORD_SIZE)
+        .as_chunks::<SEED_RECORD_SIZE>()
+        .0
+        .iter()
         .map(|c| SeedRecord {
             kind: word(c, 0),
             dst: word(c, 1),
